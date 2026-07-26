@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -144,3 +145,41 @@ def list_ports() -> list[AttachedPort]:
 
 def is_port_active(local_port: str) -> bool:
     return any(p.port == local_port for p in list_ports())
+
+
+def resolve_device_paths(local_busid: str) -> dict:
+    """Best-effort mapping from a local (post-attach) busid to the actual
+    /dev nodes it produced, so an admin can wire a new Docker container's
+    `devices:` mapping straight to it. Every USB device gets a raw usbfs
+    node (/dev/bus/usb/BBB/DDD); a serial-class device (the common case
+    here - USB-UART bridges) also gets a /dev/ttyUSBx and, if udev created
+    one, a stable /dev/serial/by-id/... symlink."""
+    result: dict = {"tty": None, "by_id": [], "raw": None}
+    if not local_busid:
+        return result
+
+    tty_dirs = glob.glob(f"/sys/bus/usb/devices/{local_busid}:*/tty/tty*") or glob.glob(
+        f"/sys/bus/usb/devices/{local_busid}/**/tty/tty*", recursive=True
+    )
+    if tty_dirs:
+        result["tty"] = "/dev/" + tty_dirs[0].rstrip("/").rsplit("/", 1)[-1]
+
+    try:
+        with open(f"/sys/bus/usb/devices/{local_busid}/busnum") as f:
+            busnum = int(f.read().strip())
+        with open(f"/sys/bus/usb/devices/{local_busid}/devnum") as f:
+            devnum = int(f.read().strip())
+        result["raw"] = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    if result["tty"]:
+        target = result["tty"].rsplit("/", 1)[-1]
+        for link in glob.glob("/dev/serial/by-id/*"):
+            try:
+                if os.path.realpath(link).rsplit("/", 1)[-1] == target:
+                    result["by_id"].append(link)
+            except OSError:
+                continue
+
+    return result

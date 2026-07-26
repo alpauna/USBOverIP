@@ -85,6 +85,7 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--bord
 .badge.attached { background: #dbeafe; color: #1e40af; }
 .badge.idle { background: #e5e7eb; color: #374151; }
 .token-box { font-family: monospace; background: var(--bg); border: 1px dashed var(--border); padding: 10px; border-radius: 6px; margin: 8px 0; word-break: break-all; }
+code { font-family: monospace; background: var(--bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; }
 .row { display: flex; gap: 8px; align-items: center; }
 .row input, .row select { flex: 1; }
 select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text); }

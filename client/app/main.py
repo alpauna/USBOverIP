@@ -360,6 +360,37 @@ async def api_attachments(user=Depends(require_session_user)):
     return {"attachments": out}
 
 
+@app.get("/api/attachments/{port}/details")
+async def api_attachment_details(port: str, user=Depends(require_session_user)):
+    cfg = config.store.read()
+    att = cfg["attachments"].get(port)
+    if not att:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such attachment")
+    live_port = next((p for p in usbip_client.list_ports() if p.port == port), None)
+    local_busid = live_port.local_busid if live_port else None
+    dev_paths = usbip_client.resolve_device_paths(local_busid) if local_busid else {
+        "tty": None,
+        "by_id": [],
+        "raw": None,
+    }
+    server = cfg["servers"].get(att["server_id"])
+    return {
+        "port": port,
+        "live": live_port is not None,
+        "local_busid": local_busid,
+        "dev_paths": dev_paths,
+        "server_id": att["server_id"],
+        "server_name": server["name"] if server else "(deleted server)",
+        "busid": att["busid"],
+        "label": att.get("label") or "",
+        "group_id": att.get("group_id"),
+        "attached_at": att.get("attached_at"),
+        "auto_failover": att.get("auto_failover", True),
+        "restart_actions": att.get("restart_actions", []),
+        "proxmox": att.get("proxmox"),
+    }
+
+
 @app.put("/api/attachments/{port}")
 async def api_update_attachment(
     port: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)

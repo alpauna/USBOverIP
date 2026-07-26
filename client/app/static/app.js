@@ -452,7 +452,9 @@ async function loadAttachments() {
       class: `badge ${att.auto_failover ? "attached" : "idle"}`,
       text: att.auto_failover ? "on" : "off",
     });
-    const actionCells = [detachBtn, ...extraActions];
+    const detailsBtn = el("button", { class: "secondary", text: "Details" });
+    detailsBtn.addEventListener("click", () => openAttachmentDetailsPanel(att.port));
+    const actionCells = [detailsBtn, detachBtn, ...extraActions];
     if (!att.group_id) {
       const editBtn = el("button", { class: "secondary", text: "Edit" });
       editBtn.addEventListener("click", () => openAttachmentEditPanel(att));
@@ -511,6 +513,66 @@ document.getElementById("attachment-edit-save-btn")?.addEventListener("click", a
   } catch (e) {
     alert(e.message);
   }
+});
+
+function codeField(text) {
+  const node = el("code", { text, class: "tiny" });
+  node.style.cursor = "pointer";
+  node.title = "Click to select";
+  node.addEventListener("click", () => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+  return node;
+}
+
+async function openAttachmentDetailsPanel(port) {
+  const panel = document.getElementById("attachment-details-panel");
+  const body = document.getElementById("attachment-details-body");
+  document.getElementById("attachment-details-title").textContent = `Port ${port}`;
+  body.innerHTML = "";
+  body.appendChild(el("p", { class: "muted", text: "Loading..." }));
+  panel.hidden = false;
+  try {
+    const d = await ajax(`/api/attachments/${port}/details`);
+    body.innerHTML = "";
+    const rows = [
+      ["Server", `${d.server_name} / ${d.busid}`],
+      ["Local bus ID", d.local_busid || "—"],
+      ["Live", d.live ? "yes" : "no (stale)"],
+    ];
+    for (const [k, v] of rows) {
+      body.appendChild(el("div", { text: `${k}: ${v}` }));
+    }
+    body.appendChild(el("div", { class: "muted", text: "Device paths (for a new container's devices: mapping):" }));
+    if (d.dev_paths.tty) {
+      body.appendChild(el("div", {}, [document.createTextNode("Serial (tty): "), codeField(d.dev_paths.tty)]));
+    }
+    for (const link of d.dev_paths.by_id) {
+      body.appendChild(el("div", {}, [document.createTextNode("Stable by-id: "), codeField(link)]));
+    }
+    if (d.dev_paths.raw) {
+      body.appendChild(el("div", {}, [document.createTextNode("Raw USB node: "), codeField(d.dev_paths.raw)]));
+    }
+    if (!d.dev_paths.tty && !d.dev_paths.raw) {
+      body.appendChild(el("p", { class: "muted", text: "No device path could be resolved (device may not be live)." }));
+    }
+    if (d.restart_actions.length) {
+      body.appendChild(
+        el("div", { class: "muted", text: `Restart actions: ${restartActionsSummary(d.restart_actions)}` })
+      );
+    }
+  } catch (e) {
+    body.innerHTML = "";
+    body.appendChild(el("p", { class: "muted", text: e.message }));
+  }
+}
+
+document.getElementById("attachment-details-close-btn")?.addEventListener("click", () => {
+  document.getElementById("attachment-details-panel").hidden = true;
 });
 
 document.getElementById("refresh-attachments-btn")?.addEventListener("click", loadAttachments);
