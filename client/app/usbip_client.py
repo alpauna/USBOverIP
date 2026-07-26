@@ -158,8 +158,15 @@ def resolve_device_paths(local_busid: str) -> dict:
     if not local_busid:
         return result
 
-    tty_dirs = glob.glob(f"/sys/bus/usb/devices/{local_busid}:*/tty/tty*") or glob.glob(
-        f"/sys/bus/usb/devices/{local_busid}/**/tty/tty*", recursive=True
+    # The interface subdirectory (busid:config.interface) holds the tty
+    # device - as either <iface>/ttyUSBx/ directly, or <iface>/tty/ttyUSBx/
+    # depending on kernel/driver version. `tty?*` (not bare `tty`) avoids
+    # matching the nested-layout directory itself as if it were the device.
+    # Both patterns are a single, bounded glob level - deliberately NOT a
+    # recursive/`**` glob into sysfs, which can hang for a very long time
+    # chasing its symlink-heavy structure.
+    tty_dirs = glob.glob(f"/sys/bus/usb/devices/{local_busid}:*/tty?*") or glob.glob(
+        f"/sys/bus/usb/devices/{local_busid}:*/tty/tty?*"
     )
     if tty_dirs:
         result["tty"] = "/dev/" + tty_dirs[0].rstrip("/").rsplit("/", 1)[-1]
