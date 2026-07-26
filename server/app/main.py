@@ -22,6 +22,7 @@ from common.security import (
 from common.webauth import LoginThrottle, require_safe_ajax, require_session_user
 
 from . import config
+from .events import EVENTS, log_event
 from .usb_devices import bind_device, list_local_devices, unbind_device
 from .usbipd_supervisor import UsbipdSupervisor
 
@@ -69,9 +70,9 @@ async def _rebind_shared_devices() -> None:
     for busid in shared:
         try:
             bind_device(busid)
-            logger.info("rebound %s on startup", busid)
+            log_event(f"rebound {busid} on startup")
         except RuntimeError as e:
-            logger.info("bind for %s on startup: %s", busid, e)
+            log_event(f"bind for {busid} on startup: {e}")
 
     devices = {d.busid: d for d in list_local_devices()}
     for busid in shared:
@@ -79,7 +80,7 @@ async def _rebind_shared_devices() -> None:
         if dev and dev.status in ("shared_idle", "shared_in_use"):
             await notify_clients_device_available(busid)
         else:
-            logger.warning("could not confirm %s is shared after startup", busid)
+            log_event(f"could not confirm {busid} is shared after startup")
 
 
 def _now() -> str:
@@ -112,9 +113,10 @@ async def notify_clients_device_available(busid: str) -> None:
         try:
             async with httpx.AsyncClient(timeout=5) as http:
                 resp = await http.post(url, headers={"Authorization": f"Bearer {client['token']}"})
-            logger.info("notified client %s about %s: HTTP %s", client["name"], busid, resp.status_code)
+            if resp.status_code != 200:
+                log_event(f"notify {client['name']} about {busid}: HTTP {resp.status_code}")
         except Exception as e:
-            logger.info("could not notify client %s about %s: %s", client["name"], busid, e)
+            log_event(f"could not notify {client['name']} about {busid}: {e}")
 
 
 def _has_admin() -> bool:
@@ -202,6 +204,7 @@ async def login_submit(request: Request):
         request.session["user"] = "admin"
         return RedirectResponse("/", status_code=303)
     throttle.record_failure(client_ip)
+    log_event(f"failed login attempt from {client_ip}")
     return templates.TemplateResponse(
         "login.html", {"request": request, "error": "Invalid password."}
     )
@@ -250,12 +253,14 @@ async def api_share(busid: str, request: Request, user=Depends(require_session_u
     except ValidationError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     except RuntimeError as e:
+        log_event(f"failed to share {busid}: {e}")
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
     config.store.update(
         lambda d: d.update(
             shared_devices=sorted(set(d.get("shared_devices", [])) | {busid})
         )
     )
+    log_event(f"shared {busid}")
     await notify_clients_device_available(busid)
     return {"ok": True}
 
@@ -269,12 +274,40 @@ async def api_unshare(busid: str, request: Request, user=Depends(require_session
     except ValidationError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     except RuntimeError as e:
+        log_event(f"failed to unshare {busid}: {e}")
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
     config.store.update(
         lambda d: d.update(
             shared_devices=[b for b in d.get("shared_devices", []) if b != busid]
         )
     )
+    log_event(f"unshared {busid}")
+    return {"ok": True}
+
+
+@app.post("/api/devices/{busid}/request-share")
+async def api_request_share(busid: str, caller: str = Depends(require_bearer_or_session)):
+    """Lets a registered client ask the server to share a device it can see
+    but that isn't shared yet, so the client's own "Attach" flow can be one
+    click instead of requiring the admin to separately visit this
+    dashboard first. No AJAX-header check here (unlike the admin's own
+    /share) - this is a machine-to-machine, bearer-token-authenticated
+    call from a client's backend, not a browser form post."""
+    try:
+        validate_busid(busid)
+        bind_device(busid)
+    except ValidationError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    except RuntimeError as e:
+        log_event(f"{caller} failed to share {busid}: {e}")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    config.store.update(
+        lambda d: d.update(
+            shared_devices=sorted(set(d.get("shared_devices", [])) | {busid})
+        )
+    )
+    log_event(f"{caller} requested share of {busid}")
+    await notify_clients_device_available(busid)
     return {"ok": True}
 
 
@@ -289,6 +322,7 @@ async def api_label(
     validate_busid(busid)
     label = str(body.get("label", ""))[:80]
     config.store.update(lambda d: d["device_labels"].__setitem__(busid, label))
+    log_event(f"labeled {busid} as '{label}'")
     return {"ok": True}
 
 
@@ -322,6 +356,7 @@ async def api_add_client(request: Request, user=Depends(require_session_user), b
         "last_seen": None,
     }
     config.store.update(lambda d: d["clients"].__setitem__(client_id, record))
+    log_event(f"registered client '{name}' ({host}:{api_port})")
     # Plaintext token is returned exactly once here; paste it into that
     # client's "Add server" form.
     return {"client": _public_client(record), "token": token}
@@ -331,18 +366,29 @@ async def api_add_client(request: Request, user=Depends(require_session_user), b
 async def api_rotate_client(client_id: str, request: Request, user=Depends(require_session_user)):
     require_safe_ajax(request)
     cfg = config.store.read()
-    if client_id not in cfg.get("clients", {}):
+    client = cfg.get("clients", {}).get(client_id)
+    if not client:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown client")
     new_token = generate_token()
     config.store.update(lambda d, t=new_token: d["clients"][client_id].__setitem__("token", t))
+    log_event(f"rotated token for client '{client['name']}'")
     return {"token": new_token}
 
 
 @app.delete("/api/clients/{client_id}")
 async def api_delete_client(client_id: str, request: Request, user=Depends(require_session_user)):
     require_safe_ajax(request)
+    cfg = config.store.read()
+    client = cfg.get("clients", {}).get(client_id)
     config.store.update(lambda d: d["clients"].pop(client_id, None))
+    if client:
+        log_event(f"removed client '{client['name']}'")
     return {"ok": True}
+
+
+@app.get("/api/events")
+async def api_events(user=Depends(require_session_user)):
+    return {"events": list(EVENTS)}
 
 
 @app.get("/healthz")

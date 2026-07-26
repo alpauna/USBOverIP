@@ -167,7 +167,23 @@ document.getElementById("save-name-btn")?.addEventListener("click", async () => 
 
 document.getElementById("refresh-btn")?.addEventListener("click", loadDevices);
 
+async function loadEvents() {
+  const list = document.getElementById("events-list");
+  if (!list) return;
+  const data = await ajax("/api/events");
+  list.innerHTML = "";
+  for (const e of data.events) {
+    list.appendChild(el("li", { text: `${new Date(e.time).toLocaleTimeString()} — ${e.message}` }));
+  }
+}
+
+document.getElementById("refresh-events-btn")?.addEventListener("click", loadEvents);
+
 loadDevices();
 loadClients();
 loadName();
-setInterval(loadDevices, 8000);
+loadEvents();
+setInterval(() => {
+  loadDevices();
+  loadEvents();
+}, 8000);

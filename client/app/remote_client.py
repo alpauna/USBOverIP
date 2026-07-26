@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import httpx
 
-from common.procutil import validate_hostname, validate_port_number
+from common.procutil import validate_busid, validate_hostname, validate_port_number
 
 
 class RemoteError(Exception):
@@ -28,6 +28,28 @@ async def fetch_devices(host: str, api_port: int, token: str) -> list[dict]:
     if resp.status_code != 200:
         raise RemoteError(f"server returned HTTP {resp.status_code}")
     return resp.json()["devices"]
+
+
+async def request_share(host: str, api_port: int, token: str, busid: str) -> None:
+    """Ask the server to share a device we can see but that isn't shared
+    yet, so our own "Attach" click can be one step instead of requiring the
+    admin to separately visit the server's dashboard first."""
+    validate_busid(busid)
+    url = f"{_base_url(host, api_port)}/api/devices/{busid}/request-share"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, headers={"Authorization": f"Bearer {token}"})
+    except httpx.RequestError as e:
+        raise RemoteError(f"could not reach server: {e}") from e
+    if resp.status_code == 401:
+        raise RemoteError("server rejected token (unauthorized)")
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("detail", "")
+        except Exception:
+            pass
+        raise RemoteError(f"server returned HTTP {resp.status_code}" + (f": {detail}" if detail else ""))
 
 
 async def fetch_info(host: str, api_port: int) -> dict:

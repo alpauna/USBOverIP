@@ -166,8 +166,12 @@ async function loadBrowseDevices() {
   }
   for (const dev of devices) {
     const badge = el("span", { class: `badge ${dev.status}`, text: dev.status });
-    const attachBtn = el("button", { text: "Attach" });
-    attachBtn.disabled = dev.status !== "shared_idle";
+    // "unshared" is still clickable: attaching will ask the server to
+    // share it first. Only a device already claimed by another client is
+    // truly blocked.
+    const attachBtn = el("button", { text: dev.status === "unshared" ? "Share & Attach" : "Attach" });
+    attachBtn.disabled = dev.status === "shared_in_use";
+    if (dev.status === "shared_in_use") attachBtn.title = "Already attached to another client";
     attachBtn.addEventListener("click", async () => {
       attachBtn.disabled = true;
       try {

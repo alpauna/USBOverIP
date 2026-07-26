@@ -288,6 +288,27 @@ async def api_direct_attach(
     server = cfg["servers"].get(server_id)
     if not server:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown server")
+
+    # One-click attach: if the device isn't shared yet, ask the server to
+    # share it first rather than requiring the admin to separately visit
+    # the server's own dashboard. If it's already claimed by another
+    # client, fail clearly instead of attempting (and failing) the attach.
+    try:
+        devices = await remote_client.fetch_devices(server["host"], server["api_port"], server["token"])
+    except remote_client.RemoteError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not reach server: {e}")
+    device = next((d for d in devices if d["busid"] == busid), None)
+    if not device:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "device not found on that server")
+    if device["status"] == "shared_in_use":
+        raise HTTPException(status.HTTP_409_CONFLICT, "device is already attached to another client")
+    if device["status"] == "unshared":
+        try:
+            await remote_client.request_share(server["host"], server["api_port"], server["token"], busid)
+        except remote_client.RemoteError as e:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not share device on server: {e}")
+        groups.log_event(f"requested share of {server['name']}/{busid}")
+
     try:
         port = usbip_client.attach(server["host"], server["usbip_port"], busid)
     except usbip_client.UsbipCommandError as e:

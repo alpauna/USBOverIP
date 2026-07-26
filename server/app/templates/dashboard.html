@@ -41,6 +41,11 @@
 </div>
 
 <div class="card narrow">
+  <div class="card-header"><h2>Recent activity</h2><button id="refresh-events-btn" class="secondary">Refresh</button></div>
+  <ul id="events-list" class="stack tiny"></ul>
+</div>
+
+<div class="card narrow">
   <h2>Security note</h2>
   <p class="muted">The USB/IP wire protocol itself (TCP port {{ "3240" }}) has no authentication built in &mdash;
   this web UI only gates discovery and sharing decisions. Restrict port 3240 at the firewall to only your known client hosts.</p>
