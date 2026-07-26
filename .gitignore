@@ -1,0 +1,28 @@
+# Secrets - never commit
+passwords.hide
+*.hide
+*.env
+.env
+.env.*
+secrets/
+*.pem
+*.key
+*.crt
+
+# Runtime data / persisted app config (tokens, password hashes, server registry)
+data/
+**/data/
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor cruft
+.DS_Store
+*.swp

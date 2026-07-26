@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Initial setup - USB/IP Server{% endblock %}
+{% block content %}
+<div class="card narrow">
+  <h1>Create admin password</h1>
+  <p class="muted">This is the first run. Set the administrator password for this USB/IP server's web UI.</p>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post" action="/setup">
+    <label>Password<input type="password" name="password" minlength="10" required autofocus></label>
+    <label>Confirm password<input type="password" name="confirm" minlength="10" required></label>
+    <button type="submit">Create account</button>
+  </form>
+</div>
+{% endblock %}

@@ -1,0 +1,100 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --card-bg: #ffffff;
+  --text: #1b1e23;
+  --muted: #6b7280;
+  --border: #e2e5ea;
+  --accent: #2563eb;
+  --danger: #dc2626;
+  --ok: #16a34a;
+  --warn: #d97706;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --card-bg: #171a21;
+    --text: #e7e9ee;
+    --muted: #9aa1ad;
+    --border: #262b34;
+    --accent: #5b8def;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card-bg);
+}
+.brand { font-weight: 600; }
+.container { max-width: 1000px; margin: 24px auto; padding: 0 16px; }
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+.card.narrow { max-width: 480px; margin-left: auto; margin-right: auto; }
+.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+h1 { font-size: 1.25rem; margin: 0 0 8px; }
+h2 { font-size: 1.05rem; margin: 0 0 8px; }
+.muted { color: var(--muted); font-size: 0.9rem; }
+label { display: block; margin-bottom: 12px; font-size: 0.9rem; }
+input {
+  width: 100%;
+  padding: 8px 10px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+}
+input[type="checkbox"] { width: auto; margin-top: 0; margin-right: 6px; }
+button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+button.danger { background: var(--danger); }
+button.link-btn { background: none; color: var(--muted); text-decoration: underline; padding: 0; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+.error { background: #fee2e2; color: #991b1b; padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 0.9rem; }
+.badge { padding: 2px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
+.badge.unshared { background: #e5e7eb; color: #374151; }
+.badge.shared_idle { background: #dbeafe; color: #1e40af; }
+.badge.shared_in_use { background: #dcfce7; color: #166534; }
+.badge.unknown { background: #fef3c7; color: #92400e; }
+.badge.online { background: #dcfce7; color: #166534; }
+.badge.offline { background: #fee2e2; color: #991b1b; }
+.badge.attached { background: #dbeafe; color: #1e40af; }
+.badge.idle { background: #e5e7eb; color: #374151; }
+.token-box { font-family: monospace; background: var(--bg); border: 1px dashed var(--border); padding: 10px; border-radius: 6px; margin: 8px 0; word-break: break-all; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row input, .row select { flex: 1; }
+select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text); }
+.list-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); gap: 10px; }
+.list-item:last-child { border-bottom: none; }
+.pill { padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; background: var(--border); }
+.stack { display: flex; flex-direction: column; gap: 6px; }
+.tiny { font-size: 0.78rem; }
+details.add-form { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+details.add-form summary { cursor: pointer; color: var(--accent); font-size: 0.9rem; margin-bottom: 8px; }
+.candidate-row { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 6px; align-items: center; }
+.candidate-row select, .candidate-row input { margin-top: 0; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }

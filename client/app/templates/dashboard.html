@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - USB/IP Client{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div class="card-header"><h1>USB/IP servers</h1><button id="refresh-servers-btn" class="secondary">Refresh</button></div>
+  <div id="servers-list" class="stack"></div>
+  <details class="add-form">
+    <summary>Add server</summary>
+    <form id="add-server-form">
+      <label>Name<input name="name" required placeholder="usbip-primary"></label>
+      <label>Host / IP<input name="host" required placeholder="192.168.1.129"></label>
+      <div class="row">
+        <label>API port<input name="api_port" value="8000"></label>
+        <label>USB/IP port<input name="usbip_port" value="3240"></label>
+      </div>
+      <label>Role
+        <select name="role"><option value="primary">primary</option><option value="backup">backup</option></select>
+      </label>
+      <label>Access token (from the server's dashboard)<input name="token" required></label>
+      <button type="submit">Add server</button>
+    </form>
+  </details>
+</div>
+
+<div class="card">
+  <div class="card-header"><h1>Browse devices</h1></div>
+  <div class="row">
+    <select id="browse-server-select"></select>
+    <button id="browse-refresh-btn" class="secondary">Load devices</button>
+  </div>
+  <table id="browse-table">
+    <thead><tr><th>Bus ID</th><th>Device</th><th>VID:PID</th><th>Status</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header"><h1>Device groups (failover)</h1></div>
+  <p class="muted">A group ties the same logical device to a primary server and one or more backups. Attaching a group tries candidates in order and skips any that are offline or already in use elsewhere.</p>
+  <div id="groups-list" class="stack"></div>
+  <details class="add-form">
+    <summary>Create group</summary>
+    <form id="add-group-form">
+      <label>Group name<input name="name" required placeholder="Zigbee dongle"></label>
+      <label><input type="checkbox" name="auto_failover" checked style="width:auto"> Auto-reattach to next candidate if the active one drops</label>
+      <div id="candidate-rows" class="stack"></div>
+      <button type="button" id="add-candidate-row-btn" class="secondary">+ Add candidate</button>
+      <button type="submit">Create group</button>
+    </form>
+  </details>
+</div>
+
+<div class="card">
+  <div class="card-header"><h1>Attached devices</h1><button id="refresh-attachments-btn" class="secondary">Refresh</button></div>
+  <table id="attachments-table">
+    <thead><tr><th>Port</th><th>Server</th><th>Bus ID</th><th>Label</th><th>Status</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="muted" id="attachments-empty" hidden>No devices currently attached.</p>
+</div>
+
+{% if proxmox_available %}
+<div class="card narrow">
+  <h2>Proxmox</h2>
+  <p class="muted">This client is running directly on a Proxmox node. Use "Send to VM" next to an attached device above.</p>
+</div>
+{% endif %}
+
+{% if docker_available %}
+<div class="card">
+  <div class="card-header"><h2>Local Docker containers</h2><button id="refresh-docker-btn" class="secondary">Refresh</button></div>
+  <p class="muted">If a container bind-mounts /dev/bus/usb with a wildcard device-cgroup rule, newly attached devices appear automatically. Restart is only needed for containers that reference a specific device path.</p>
+  <table id="docker-table">
+    <thead><tr><th>Name</th><th>Image</th><th>Status</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+{% endif %}
+
+<div class="card narrow">
+  <h2>Recent activity</h2>
+  <ul id="events-list" class="stack tiny"></ul>
+</div>
+
+<script>
+  window.__USBIP_CLIENT__ = {
+    proxmoxAvailable: {{ "true" if proxmox_available else "false" }},
+    dockerAvailable: {{ "true" if docker_available else "false" }}
+  };
+</script>
+<script src="/static/app.js"></script>
+{% endblock %}

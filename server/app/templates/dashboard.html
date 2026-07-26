@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - USB/IP Server{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h1>Local USB devices</h1>
+    <button id="refresh-btn" class="secondary">Refresh</button>
+  </div>
+  <table id="devices-table">
+    <thead>
+      <tr><th>Bus ID</th><th>Device</th><th>VID:PID</th><th>Label</th><th>Status</th><th></th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <p class="muted" id="devices-empty" hidden>No USB devices detected.</p>
+</div>
+
+<div class="card narrow">
+  <h2>Server name</h2>
+  <p class="muted">Friendly name shown to clients (e.g. "usbip-primary", "usbip-backup").</p>
+  <div class="row">
+    <input id="server-name-input" type="text" maxlength="60">
+    <button id="save-name-btn" class="secondary">Save</button>
+  </div>
+</div>
+
+<div class="card narrow">
+  <h2>Client access token</h2>
+  <p class="muted">Clients authenticate to this server's API with this bearer token. Rotating it immediately invalidates the old one for all clients.</p>
+  <p id="token-status" class="muted"></p>
+  <div id="token-value" class="token-box" hidden></div>
+  <button id="rotate-token-btn" class="secondary">Rotate token</button>
+</div>
+
+<div class="card narrow">
+  <h2>Security note</h2>
+  <p class="muted">The USB/IP wire protocol itself (TCP port {{ "3240" }}) has no authentication built in &mdash;
+  this web UI only gates discovery and sharing decisions. Restrict port 3240 at the firewall to only your known client hosts.</p>
+</div>
+
+<script src="/static/app.js"></script>
+{% endblock %}

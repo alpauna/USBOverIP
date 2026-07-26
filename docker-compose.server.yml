@@ -1,0 +1,35 @@
+# Deploy on the box with the physical USB devices (e.g. the "USBIPServer"
+# debian host). Run with: docker compose -f docker-compose.server.yml up -d
+#
+# Why privileged + host networking + these mounts:
+#   - privileged + /lib/modules: lets the container modprobe usbip-core /
+#     usbip-host into the *host* kernel (containers share the host kernel;
+#     there's no such thing as a per-container kernel module).
+#   - /dev/bus/usb, /sys/bus/usb: needed to enumerate and bind/unbind the
+#     host's actual USB devices.
+#   - network_mode: host: usbipd must be reachable on TCP 3240 by clients,
+#     and this is simplest with host networking. IMPORTANT: usbip's wire
+#     protocol has no authentication - firewall port 3240 to only your
+#     known client IPs (see README "Security model").
+services:
+  usbip-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: usbip-web-server
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    environment:
+      WEB_PORT: "8000"
+      USBIPD_PORT: "3240"
+      SERVER_NAME: "usbip-primary"
+      HTTPS_ONLY_COOKIE: "0"
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+      - /sys/bus/usb:/sys/bus/usb
+      - /lib/modules:/lib/modules:ro
+      - usbip-server-data:/data
+
+volumes:
+  usbip-server-data:
