@@ -55,19 +55,31 @@ async def on_shutdown():
 
 
 async def _rebind_shared_devices() -> None:
-    """Devices don't stay bound across a reboot/container recreate - the
-    kernel forgets. Re-bind whatever the admin previously shared and let
-    registered clients know it's back, so a server reboot self-heals
-    instead of silently dropping the share until someone notices."""
+    """Devices don't stay bound across a VM reboot - the kernel forgets.
+    But a plain container restart is different: the kernel-level bind can
+    survive even though the *daemon process* (and any client TCP sessions
+    to it) didn't. Either way, clients may need to reconnect, so we check
+    actual current status rather than trusting whether our bind attempt
+    itself reported success - "already bound" isn't a failure worth
+    skipping the notification for."""
     cfg = config.store.read()
-    for busid in list(cfg.get("shared_devices", [])):
+    shared = list(cfg.get("shared_devices", []))
+    if not shared:
+        return
+    for busid in shared:
         try:
             bind_device(busid)
+            logger.info("rebound %s on startup", busid)
         except RuntimeError as e:
-            logger.warning("could not rebind %s on startup: %s", busid, e)
-            continue
-        logger.info("rebound %s on startup", busid)
-        await notify_clients_device_available(busid)
+            logger.info("bind for %s on startup: %s", busid, e)
+
+    devices = {d.busid: d for d in list_local_devices()}
+    for busid in shared:
+        dev = devices.get(busid)
+        if dev and dev.status in ("shared_idle", "shared_in_use"):
+            await notify_clients_device_available(busid)
+        else:
+            logger.warning("could not confirm %s is shared after startup", busid)
 
 
 def _now() -> str:
