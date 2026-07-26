@@ -23,6 +23,7 @@ function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "text") node.textContent = v;
+    else if (k === "html") node.innerHTML = v;
     else node.setAttribute(k, v);
   }
   for (const child of children) node.appendChild(child);
@@ -81,17 +82,72 @@ async function loadDevices() {
   }
 }
 
-async function loadTokenStatus() {
-  const status = document.getElementById("token-status");
+async function loadClients() {
+  const list = document.getElementById("clients-list");
   try {
-    const data = await ajax("/api/token/status");
-    status.textContent = data.has_token
-      ? `Token active (created ${new Date(data.created_at).toLocaleString()})`
-      : "No token generated yet. Clients cannot connect until you rotate one.";
+    const data = await ajax("/api/clients");
+    list.innerHTML = "";
+    if (data.clients.length === 0) {
+      list.appendChild(el("p", { class: "muted", text: "No clients registered yet." }));
+      return;
+    }
+    for (const c of data.clients) {
+      const lastSeen = c.last_seen ? new Date(c.last_seen).toLocaleString() : "never";
+      const rotateBtn = el("button", { class: "secondary", text: "Rotate token" });
+      rotateBtn.addEventListener("click", async () => {
+        if (!confirm(`Rotate the token for "${c.name}"? Its old token stops working immediately.`)) return;
+        const data = await ajax(`/api/clients/${c.id}/rotate`, { method: "POST" });
+        const box = document.getElementById("new-client-token");
+        box.hidden = false;
+        box.textContent = `New token for ${c.name} (copy it now, it will not be shown again):\n${data.token}`;
+      });
+      const removeBtn = el("button", { class: "secondary", text: "Remove" });
+      removeBtn.addEventListener("click", async () => {
+        if (!confirm(`Remove client "${c.name}"?`)) return;
+        await ajax(`/api/clients/${c.id}`, { method: "DELETE" });
+        await loadClients();
+      });
+      list.appendChild(
+        el("div", { class: "list-item" }, [
+          el("div", { class: "stack" }, [
+            el("div", { html: `<strong>${c.name}</strong>` }),
+            el("div", { class: "muted tiny", text: `${c.host}:${c.api_port} • last seen ${lastSeen}` }),
+          ]),
+          el("div", { class: "actions" }, [rotateBtn, removeBtn]),
+        ])
+      );
+    }
   } catch (e) {
-    status.textContent = "Unable to load token status.";
+    list.innerHTML = "";
+    list.appendChild(el("p", { class: "muted", text: "Unable to load clients." }));
   }
 }
+
+document.getElementById("add-client-form")?.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const fd = new FormData(form);
+  try {
+    const data = await ajax("/api/clients", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: fd.get("name"),
+        host: fd.get("host"),
+        api_port: fd.get("api_port"),
+      }),
+    });
+    form.reset();
+    const box = document.getElementById("new-client-token");
+    box.hidden = false;
+    box.textContent = `Token for ${data.client.name} (copy it now, it will not be shown again):\n${data.token}`;
+    await loadClients();
+  } catch (e) {
+    alert(e.message);
+  }
+});
+
+document.getElementById("refresh-clients-btn")?.addEventListener("click", loadClients);
 
 async function loadName() {
   try {
@@ -111,16 +167,7 @@ document.getElementById("save-name-btn")?.addEventListener("click", async () => 
 
 document.getElementById("refresh-btn")?.addEventListener("click", loadDevices);
 
-document.getElementById("rotate-token-btn")?.addEventListener("click", async () => {
-  if (!confirm("Rotating the token immediately invalidates the old one for every client. Continue?")) return;
-  const data = await ajax("/api/token/rotate", { method: "POST" });
-  const box = document.getElementById("token-value");
-  box.hidden = false;
-  box.textContent = `New token (copy it now, it will not be shown again):\n${data.token}`;
-  await loadTokenStatus();
-});
-
 loadDevices();
-loadTokenStatus();
+loadClients();
 loadName();
 setInterval(loadDevices, 8000);

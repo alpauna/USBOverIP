@@ -97,4 +97,6 @@ details.add-form { margin-top: 14px; border-top: 1px solid var(--border); paddin
 details.add-form summary { cursor: pointer; color: var(--accent); font-size: 0.9rem; margin-bottom: 8px; }
 .candidate-row { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 6px; align-items: center; }
 .candidate-row select, .candidate-row input { margin-top: 0; }
+.restart-action-row { display: grid; grid-template-columns: 1fr 2fr auto; gap: 6px; align-items: center; margin-bottom: 6px; }
+.restart-action-row select, .restart-action-row input { margin-top: 0; }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }

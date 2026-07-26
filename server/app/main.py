@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import datetime
+import hmac
 import logging
+import uuid
 
+import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from common.procutil import ValidationError, validate_busid
+from common.procutil import ValidationError, validate_busid, validate_hostname, validate_port_number
 from common.security import (
     PasswordTooLongError,
     generate_token,
     hash_password,
-    hash_token,
     verify_password,
-    verify_token,
 )
 from common.webauth import LoginThrottle, require_safe_ajax, require_session_user
 
@@ -45,11 +46,63 @@ supervisor = UsbipdSupervisor(port=config.USBIPD_PORT)
 @app.on_event("startup")
 async def on_startup():
     await supervisor.start()
+    await _rebind_shared_devices()
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await supervisor.stop()
+
+
+async def _rebind_shared_devices() -> None:
+    """Devices don't stay bound across a reboot/container recreate - the
+    kernel forgets. Re-bind whatever the admin previously shared and let
+    registered clients know it's back, so a server reboot self-heals
+    instead of silently dropping the share until someone notices."""
+    cfg = config.store.read()
+    for busid in list(cfg.get("shared_devices", [])):
+        try:
+            bind_device(busid)
+        except RuntimeError as e:
+            logger.warning("could not rebind %s on startup: %s", busid, e)
+            continue
+        logger.info("rebound %s on startup", busid)
+        await notify_clients_device_available(busid)
+
+
+def _now() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+def _public_client(c: dict) -> dict:
+    return {
+        "id": c["id"],
+        "name": c["name"],
+        "host": c["host"],
+        "api_port": c["api_port"],
+        "created_at": c["created_at"],
+        "last_seen": c.get("last_seen"),
+        "has_token": bool(c.get("token")),
+    }
+
+
+async def notify_clients_device_available(busid: str) -> None:
+    """Best-effort push telling every registered client that `busid` just
+    became shared/available, so clients with a matching (now-dropped)
+    attachment can reconnect immediately instead of waiting for their own
+    watchdog poll. Never raises - a client being unreachable must not
+    block the share/rebind action that triggered this."""
+    cfg = config.store.read()
+    for client in cfg.get("clients", {}).values():
+        if not client.get("token"):
+            continue
+        url = f"http://{client['host']}:{client['api_port']}/api/remote/devices/{busid}/reconnect"
+        try:
+            async with httpx.AsyncClient(timeout=5) as http:
+                resp = await http.post(url, headers={"Authorization": f"Bearer {client['token']}"})
+            logger.info("notified client %s about %s: HTTP %s", client["name"], busid, resp.status_code)
+        except Exception as e:
+            logger.info("could not notify client %s about %s: %s", client["name"], busid, e)
 
 
 def _has_admin() -> bool:
@@ -58,7 +111,7 @@ def _has_admin() -> bool:
 
 async def require_bearer_or_session(request: Request) -> str:
     """API auth for /api/devices: either a logged-in browser session
-    (server's own web UI) or a valid client bearer token."""
+    (server's own web UI) or a registered client's bearer token."""
     user = request.session.get("user")
     if user:
         return "session:" + user
@@ -66,8 +119,12 @@ async def require_bearer_or_session(request: Request) -> str:
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
         cfg = config.store.read()
-        if verify_token(token, cfg["token_salt"], cfg["token_hash"]):
-            return "client-token"
+        for client_id, client in cfg.get("clients", {}).items():
+            if client.get("token") and hmac.compare_digest(token, client["token"]):
+                config.store.update(
+                    lambda d, cid=client_id: d["clients"][cid].__setitem__("last_seen", _now())
+                )
+                return "client:" + client_id
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
 
 
@@ -79,11 +136,7 @@ async def index(request: Request):
         return RedirectResponse("/setup")
     if not request.session.get("user"):
         return RedirectResponse("/login")
-    cfg = config.store.read()
-    return templates.TemplateResponse(
-        "dashboard.html",
-        {"request": request, "has_token": bool(cfg["token_hash"])},
-    )
+    return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
 @app.get("/setup", response_class=HTMLResponse)
@@ -186,6 +239,12 @@ async def api_share(busid: str, request: Request, user=Depends(require_session_u
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     except RuntimeError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    config.store.update(
+        lambda d: d.update(
+            shared_devices=sorted(set(d.get("shared_devices", [])) | {busid})
+        )
+    )
+    await notify_clients_device_available(busid)
     return {"ok": True}
 
 
@@ -199,6 +258,11 @@ async def api_unshare(busid: str, request: Request, user=Depends(require_session
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     except RuntimeError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    config.store.update(
+        lambda d: d.update(
+            shared_devices=[b for b in d.get("shared_devices", []) if b != busid]
+        )
+    )
     return {"ok": True}
 
 
@@ -216,27 +280,57 @@ async def api_label(
     return {"ok": True}
 
 
-@app.get("/api/token/status")
-async def api_token_status(request: Request, user=Depends(require_session_user)):
+@app.get("/api/clients")
+async def api_list_clients(user=Depends(require_session_user)):
     cfg = config.store.read()
-    return {
-        "has_token": bool(cfg["token_hash"]),
-        "created_at": cfg["token_created_at"],
+    return {"clients": [_public_client(c) for c in cfg.get("clients", {}).values()]}
+
+
+@app.post("/api/clients")
+async def api_add_client(request: Request, user=Depends(require_session_user), body: dict = Body(...)):
+    require_safe_ajax(request)
+    name = str(body.get("name", "")).strip()[:60]
+    host = str(body.get("host", "")).strip()
+    if not name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "name is required")
+    try:
+        validate_hostname(host)
+        api_port = validate_port_number(body.get("api_port", 8001))
+    except ValidationError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    client_id = uuid.uuid4().hex[:8]
+    token = generate_token()
+    record = {
+        "id": client_id,
+        "name": name,
+        "host": host,
+        "api_port": api_port,
+        "token": token,
+        "created_at": _now(),
+        "last_seen": None,
     }
+    config.store.update(lambda d: d["clients"].__setitem__(client_id, record))
+    # Plaintext token is returned exactly once here; paste it into that
+    # client's "Add server" form.
+    return {"client": _public_client(record), "token": token}
 
 
-@app.post("/api/token/rotate")
-async def api_token_rotate(request: Request, user=Depends(require_session_user)):
+@app.post("/api/clients/{client_id}/rotate")
+async def api_rotate_client(client_id: str, request: Request, user=Depends(require_session_user)):
     require_safe_ajax(request)
     cfg = config.store.read()
+    if client_id not in cfg.get("clients", {}):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown client")
     new_token = generate_token()
-    token_hash = hash_token(new_token, cfg["token_salt"])
-    now = datetime.datetime.utcnow().isoformat() + "Z"
-    config.store.update(
-        lambda d: d.update(token_hash=token_hash, token_created_at=now)
-    )
-    # Plaintext token is returned exactly once; only its hash is persisted.
-    return {"token": new_token, "created_at": now}
+    config.store.update(lambda d, t=new_token: d["clients"][client_id].__setitem__("token", t))
+    return {"token": new_token}
+
+
+@app.delete("/api/clients/{client_id}")
+async def api_delete_client(client_id: str, request: Request, user=Depends(require_session_user)):
+    require_safe_ajax(request)
+    config.store.update(lambda d: d["clients"].pop(client_id, None))
+    return {"ok": True}
 
 
 @app.get("/healthz")

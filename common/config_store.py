@@ -35,23 +35,27 @@ class ConfigStore:
                 os.unlink(tmp_path)
             raise
 
+    def _load(self) -> dict[str, Any]:
+        """Read the file and backfill any top-level keys added to the
+        schema since this file was written (e.g. after an upgrade), so
+        code can rely on `d["new_key"]` existing without every call site
+        needing a defensive `.get(..., default)`."""
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return self._defaults()
+        merged = self._defaults()
+        merged.update(data)
+        return merged
+
     def read(self) -> dict[str, Any]:
         with self._lock:
-            try:
-                with open(self.path) as f:
-                    return json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                data = self._defaults()
-                self._write(data)
-                return data
+            return self._load()
 
     def update(self, mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
         with self._lock:
-            try:
-                with open(self.path) as f:
-                    data = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                data = self._defaults()
+            data = self._load()
             mutate(data)
             self._write(data)
             return data

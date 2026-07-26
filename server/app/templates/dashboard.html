@@ -24,12 +24,20 @@
   </div>
 </div>
 
-<div class="card narrow">
-  <h2>Client access token</h2>
-  <p class="muted">Clients authenticate to this server's API with this bearer token. Rotating it immediately invalidates the old one for all clients.</p>
-  <p id="token-status" class="muted"></p>
-  <div id="token-value" class="token-box" hidden></div>
-  <button id="rotate-token-btn" class="secondary">Rotate token</button>
+<div class="card">
+  <div class="card-header"><h2>Registered clients</h2><button id="refresh-clients-btn" class="secondary">Refresh</button></div>
+  <p class="muted">Each client authenticates with its own access token. Rotating a client's token immediately invalidates its old one; that client will need the new value pasted into its "Add server" / server entry.</p>
+  <div id="clients-list" class="stack"></div>
+  <div id="new-client-token" class="token-box" hidden></div>
+  <details class="add-form">
+    <summary>Add client</summary>
+    <form id="add-client-form">
+      <label>Name<input name="name" required placeholder="ha-vm"></label>
+      <label>Host / IP<input name="host" required placeholder="192.168.0.46"></label>
+      <label>API port<input name="api_port" value="8001"></label>
+      <button type="submit">Add client &amp; generate token</button>
+    </form>
+  </details>
 </div>
 
 <div class="card narrow">

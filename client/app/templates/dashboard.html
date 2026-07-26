@@ -5,6 +5,14 @@
 <div class="card">
   <div class="card-header"><h1>USB/IP servers</h1><button id="refresh-servers-btn" class="secondary">Refresh</button></div>
   <div id="servers-list" class="stack"></div>
+  <div id="server-edit-panel" class="add-form" hidden>
+    <strong id="server-edit-title"></strong>
+    <label>New access token<input id="server-edit-token" placeholder="paste the token from that server's dashboard"></label>
+    <div class="row">
+      <button type="button" id="server-edit-save-btn">Save</button>
+      <button type="button" id="server-edit-cancel-btn" class="secondary">Cancel</button>
+    </div>
+  </div>
   <details class="add-form">
     <summary>Add server</summary>
     <form id="add-server-form">
@@ -39,6 +47,16 @@
   <div class="card-header"><h1>Device groups (failover)</h1></div>
   <p class="muted">A group ties the same logical device to a primary server and one or more backups. Attaching a group tries candidates in order and skips any that are offline or already in use elsewhere.</p>
   <div id="groups-list" class="stack"></div>
+  <div id="group-edit-panel" class="add-form" hidden>
+    <strong id="group-edit-title"></strong>
+    <label><input type="checkbox" id="group-edit-auto-failover" style="width:auto"> Auto-reattach to next candidate if the active one drops</label>
+    <div id="group-edit-restart-rows" class="stack"></div>
+    <button type="button" id="group-edit-add-restart-row-btn" class="secondary">+ Add restart action</button>
+    <div class="row" style="margin-top:10px">
+      <button type="button" id="group-edit-save-btn">Save</button>
+      <button type="button" id="group-edit-cancel-btn" class="secondary">Cancel</button>
+    </div>
+  </div>
   <details class="add-form">
     <summary>Create group</summary>
     <form id="add-group-form">
@@ -46,6 +64,9 @@
       <label><input type="checkbox" name="auto_failover" checked style="width:auto"> Auto-reattach to next candidate if the active one drops</label>
       <div id="candidate-rows" class="stack"></div>
       <button type="button" id="add-candidate-row-btn" class="secondary">+ Add candidate</button>
+      <p class="muted tiny" style="margin-top:10px">Restart actions run after every successful (re)attach - e.g. a Docker container or systemd service that had the device open and needs to notice it came back.</p>
+      <div id="group-restart-rows" class="stack"></div>
+      <button type="button" id="add-group-restart-row-btn" class="secondary">+ Add restart action</button>
       <button type="submit">Create group</button>
     </form>
   </details>
@@ -54,10 +75,20 @@
 <div class="card">
   <div class="card-header"><h1>Attached devices</h1><button id="refresh-attachments-btn" class="secondary">Refresh</button></div>
   <table id="attachments-table">
-    <thead><tr><th>Port</th><th>Server</th><th>Bus ID</th><th>Label</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Port</th><th>Server</th><th>Bus ID</th><th>Label</th><th>Auto-reconnect</th><th>Status</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   <p class="muted" id="attachments-empty" hidden>No devices currently attached.</p>
+  <div id="attachment-edit-panel" class="add-form" hidden>
+    <strong id="attachment-edit-title"></strong>
+    <label><input type="checkbox" id="attachment-edit-auto-failover" style="width:auto"> Auto-reconnect if this attachment drops</label>
+    <div id="attachment-edit-restart-rows" class="stack"></div>
+    <button type="button" id="attachment-edit-add-restart-row-btn" class="secondary">+ Add restart action</button>
+    <div class="row" style="margin-top:10px">
+      <button type="button" id="attachment-edit-save-btn">Save</button>
+      <button type="button" id="attachment-edit-cancel-btn" class="secondary">Cancel</button>
+    </div>
+  </div>
 </div>
 
 {% if proxmox_available %}

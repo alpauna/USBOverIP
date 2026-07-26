@@ -15,6 +15,7 @@ VMID_RE = re.compile(r"^\d{1,6}$")
 USBSLOT_RE = re.compile(r"^usb\d$")
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,253}$")
 CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.\-]{0,127}$")
 
 
 class ValidationError(ValueError):
@@ -49,6 +50,12 @@ def validate_hostname(host: str) -> str:
 def validate_container_name(name: str) -> str:
     if not isinstance(name, str) or not CONTAINER_NAME_RE.match(name):
         raise ValidationError(f"invalid container name: {name!r}")
+    return name
+
+
+def validate_service_name(name: str) -> str:
+    if not isinstance(name, str) or not SERVICE_NAME_RE.match(name):
+        raise ValidationError(f"invalid systemd service name: {name!r}")
     return name
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import hmac
 import logging
 import uuid
 
@@ -59,6 +61,21 @@ def _public_server(s: dict) -> dict:
         "role": s.get("role", "primary"),
         "has_token": bool(s.get("token")),
     }
+
+
+async def require_server_token(request: Request) -> str:
+    """Auth for endpoints a *server* calls on us (currently just the
+    reconnect push). The bearer token must match one of our registered
+    servers' tokens - the same secret that server issued us to call it, now
+    used the other direction to let it call us. Returns that server_id."""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        cfg = config.store.read()
+        for server_id, server in cfg["servers"].items():
+            if server.get("token") and hmac.compare_digest(token, server["token"]):
+                return server_id
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
 
 
 # ---------------------------------------------------------------- web pages
@@ -176,6 +193,38 @@ async def api_add_server(request: Request, user=Depends(require_session_user), b
     return {"server": _public_server(record)}
 
 
+@app.put("/api/servers/{server_id}")
+async def api_update_server(
+    server_id: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)
+):
+    require_safe_ajax(request)
+    cfg = config.store.read()
+    existing = cfg["servers"].get(server_id)
+    if not existing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown server")
+    name = str(body.get("name", existing["name"])).strip()[:60] or existing["name"]
+    host = str(body.get("host", existing["host"])).strip()
+    role = str(body.get("role", existing.get("role", "primary"))).strip() or "primary"
+    token = str(body.get("token", "")).strip() or existing["token"]
+    try:
+        validate_hostname(host)
+        api_port = validate_port_number(body.get("api_port", existing["api_port"]))
+        usbip_port = validate_port_number(body.get("usbip_port", existing["usbip_port"]))
+    except ValidationError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    updated = {
+        "id": server_id,
+        "name": name,
+        "host": host,
+        "api_port": api_port,
+        "usbip_port": usbip_port,
+        "token": token,
+        "role": role if role in ("primary", "backup") else "primary",
+    }
+    config.store.update(lambda d: d["servers"].__setitem__(server_id, updated))
+    return {"server": _public_server(updated)}
+
+
 @app.delete("/api/servers/{server_id}")
 async def api_delete_server(server_id: str, request: Request, user=Depends(require_session_user)):
     require_safe_ajax(request)
@@ -211,9 +260,27 @@ async def api_server_health(server_id: str, user=Depends(require_session_user)):
 
 # ---------------------------------------------------------- direct attach
 
+def _clean_restart_actions(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    cleaned = []
+    for item in raw[:10]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type", "")).strip()
+        name = str(item.get("name", "")).strip()[:128]
+        if kind in ("docker", "systemd") and name:
+            cleaned.append({"type": kind, "name": name})
+    return cleaned
+
+
 @app.post("/api/servers/{server_id}/devices/{busid}/attach")
 async def api_direct_attach(
-    server_id: str, busid: str, request: Request, user=Depends(require_session_user)
+    server_id: str,
+    busid: str,
+    request: Request,
+    user=Depends(require_session_user),
+    body: dict = Body(default={}),
 ):
     require_safe_ajax(request)
     validate_busid(busid)
@@ -228,10 +295,11 @@ async def api_direct_attach(
     record = {
         "server_id": server_id,
         "busid": busid,
-        "label": "",
+        "label": str(body.get("label", ""))[:80],
         "group_id": None,
         "attached_at": _now(),
-        "auto_failover": False,
+        "auto_failover": bool(body.get("auto_failover", True)),
+        "restart_actions": _clean_restart_actions(body.get("restart_actions")),
     }
     config.store.update(lambda d, p=port, r=record: d["attachments"].__setitem__(p, r))
     groups.log_event(f"direct attach: {server['name']}/{busid} -> port {port}")
@@ -239,8 +307,6 @@ async def api_direct_attach(
 
 
 def _now() -> str:
-    import datetime
-
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 
@@ -264,11 +330,32 @@ async def api_attachments(user=Depends(require_session_user)):
                 "group_id": att.get("group_id"),
                 "attached_at": att.get("attached_at"),
                 "auto_failover": att.get("auto_failover", False),
+                "restart_actions": att.get("restart_actions", []),
                 "proxmox": att.get("proxmox"),
                 "live": port in live_ports,
             }
         )
     return {"attachments": out}
+
+
+@app.put("/api/attachments/{port}")
+async def api_update_attachment(
+    port: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)
+):
+    require_safe_ajax(request)
+    cfg = config.store.read()
+    att = cfg["attachments"].get(port)
+    if not att:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such attachment")
+    updates = {
+        "label": str(body.get("label", att.get("label", "")))[:80],
+        "auto_failover": bool(body.get("auto_failover", att.get("auto_failover", True))),
+        "restart_actions": _clean_restart_actions(
+            body.get("restart_actions", att.get("restart_actions"))
+        ),
+    }
+    config.store.update(lambda d, p=port, u=updates: d["attachments"][p].update(u))
+    return {"ok": True}
 
 
 @app.post("/api/attachments/{port}/detach")
@@ -321,9 +408,46 @@ async def api_create_group(request: Request, user=Depends(require_session_user),
         "name": name,
         "candidates": clean,
         "auto_failover": bool(body.get("auto_failover", True)),
+        "restart_actions": _clean_restart_actions(body.get("restart_actions")),
     }
     config.store.update(lambda d: d["groups"].__setitem__(group_id, record))
     return {"group": record}
+
+
+@app.put("/api/groups/{group_id}")
+async def api_update_group(
+    group_id: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)
+):
+    require_safe_ajax(request)
+    cfg = config.store.read()
+    existing = cfg["groups"].get(group_id)
+    if not existing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown group")
+    if any(a.get("group_id") == group_id for a in cfg["attachments"].values()):
+        raise HTTPException(status.HTTP_409_CONFLICT, "group is currently attached, detach first")
+    name = str(body.get("name", existing["name"])).strip()[:60] or existing["name"]
+    candidates = body.get("candidates", existing["candidates"])
+    if not isinstance(candidates, list) or not candidates:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least one candidate is required")
+    clean = []
+    for c in candidates:
+        sid = str(c.get("server_id", ""))
+        busid = str(c.get("busid", ""))
+        if sid not in cfg["servers"]:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown server_id {sid}")
+        validate_busid(busid)
+        clean.append({"server_id": sid, "busid": busid, "label": str(c.get("label", ""))[:60]})
+    updated = {
+        "id": group_id,
+        "name": name,
+        "candidates": clean,
+        "auto_failover": bool(body.get("auto_failover", existing.get("auto_failover", True))),
+        "restart_actions": _clean_restart_actions(
+            body.get("restart_actions", existing.get("restart_actions"))
+        ),
+    }
+    config.store.update(lambda d: d["groups"].__setitem__(group_id, updated))
+    return {"group": updated}
 
 
 @app.delete("/api/groups/{group_id}")
@@ -434,3 +558,19 @@ async def api_docker_restart(name: str, request: Request, user=Depends(require_s
     except (ValidationError, RuntimeError) as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ remote
+# Endpoints called BY a registered server, not by our own browser session -
+# see require_server_token above. This is how a server pushes "this device
+# is shared/available again" (e.g. after an admin re-shares it, or after
+# the server itself rebinds on startup) instead of us only finding out via
+# our own watchdog poll.
+
+@app.post("/api/remote/devices/{busid}/reconnect")
+async def api_remote_reconnect(busid: str, server_id: str = Depends(require_server_token)):
+    validate_busid(busid)
+    result = await groups.reconnect_device(server_id, busid)
+    if result is None:
+        return {"status": "no_attachment_on_record"}
+    return result

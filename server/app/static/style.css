@@ -88,3 +88,8 @@ select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
 .pill { padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; background: var(--border); }
 .stack { display: flex; flex-direction: column; gap: 6px; }
 .tiny { font-size: 0.78rem; }
+details.add-form { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+details.add-form summary { cursor: pointer; color: var(--accent); font-size: 0.9rem; margin-bottom: 8px; }
+.badge.online { background: #dcfce7; color: #166534; }
+.badge.offline { background: #fee2e2; color: #991b1b; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }

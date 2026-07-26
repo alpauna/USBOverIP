@@ -57,16 +57,50 @@ function renderServers() {
         alert(e.message);
       }
     });
+    const editBtn = el("button", { class: "secondary", text: "Edit token" });
+    editBtn.addEventListener("click", () => openServerEditPanel(s));
     const item = el("div", { class: "list-item" }, [
       el("div", { class: "stack" }, [
         el("div", { html: `<strong>${s.name}</strong> <span class="pill">${s.role}</span>` }),
         el("div", { class: "muted tiny", text: `${s.host}:${s.api_port} (usbip port ${s.usbip_port})` }),
       ]),
-      el("div", { class: "actions" }, [badge, del]),
+      el("div", { class: "actions" }, [badge, editBtn, del]),
     ]);
     list.appendChild(item);
   }
 }
+
+let EDITING_SERVER_ID = null;
+
+function openServerEditPanel(s) {
+  EDITING_SERVER_ID = s.id;
+  document.getElementById("server-edit-title").textContent = s.name;
+  document.getElementById("server-edit-token").value = "";
+  document.getElementById("server-edit-panel").hidden = false;
+}
+
+document.getElementById("server-edit-cancel-btn")?.addEventListener("click", () => {
+  document.getElementById("server-edit-panel").hidden = true;
+  EDITING_SERVER_ID = null;
+});
+
+document.getElementById("server-edit-save-btn")?.addEventListener("click", async () => {
+  if (!EDITING_SERVER_ID) return;
+  const token = document.getElementById("server-edit-token").value.trim();
+  if (!token) return alert("Paste the new token first.");
+  try {
+    await ajax(`/api/servers/${EDITING_SERVER_ID}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    document.getElementById("server-edit-panel").hidden = true;
+    EDITING_SERVER_ID = null;
+    await loadServers();
+  } catch (e) {
+    alert(e.message);
+  }
+});
 
 async function checkServerHealth(serverId, badgeEl) {
   try {
@@ -159,6 +193,37 @@ async function loadBrowseDevices() {
 document.getElementById("browse-refresh-btn")?.addEventListener("click", loadBrowseDevices);
 document.getElementById("browse-server-select")?.addEventListener("change", loadBrowseDevices);
 
+// --------------------------------------------------------- restart actions
+
+function addRestartActionRow(container, initial = {}) {
+  const typeSelect = el("select", {});
+  typeSelect.appendChild(el("option", { value: "docker", text: "docker container" }));
+  typeSelect.appendChild(el("option", { value: "systemd", text: "systemd service" }));
+  if (initial.type) typeSelect.value = initial.type;
+  const nameInput = el("input", { placeholder: "name e.g. zigbee2mqtt", value: initial.name || "" });
+  const removeBtn = el("button", { type: "button", class: "secondary", text: "✕" });
+  const row = el("div", { class: "restart-action-row" }, [typeSelect, nameInput, removeBtn]);
+  removeBtn.addEventListener("click", () => row.remove());
+  row._get = () => ({ type: typeSelect.value, name: nameInput.value.trim() });
+  container.appendChild(row);
+  return row;
+}
+
+function collectRestartActions(container) {
+  return Array.from(container.children)
+    .map((r) => r._get())
+    .filter((a) => a.name);
+}
+
+function restartActionsSummary(actions) {
+  if (!actions || actions.length === 0) return "";
+  return actions.map((a) => `${a.type}:${a.name}`).join(", ");
+}
+
+document.getElementById("add-group-restart-row-btn")?.addEventListener("click", () => {
+  addRestartActionRow(document.getElementById("group-restart-rows"));
+});
+
 // ---------------------------------------------------------------- groups
 
 document.getElementById("add-candidate-row-btn")?.addEventListener("click", () => addCandidateRow());
@@ -185,6 +250,7 @@ document.getElementById("add-group-form")?.addEventListener("submit", async (ev)
     alert("Add at least one candidate server/device.");
     return;
   }
+  const restartActions = collectRestartActions(document.getElementById("group-restart-rows"));
   try {
     await ajax("/api/groups", {
       method: "POST",
@@ -193,10 +259,12 @@ document.getElementById("add-group-form")?.addEventListener("submit", async (ev)
         name: form.name.value,
         auto_failover: form.auto_failover.checked,
         candidates,
+        restart_actions: restartActions,
       }),
     });
     form.reset();
     document.getElementById("candidate-rows").innerHTML = "";
+    document.getElementById("group-restart-rows").innerHTML = "";
     await loadGroups();
   } catch (e) {
     alert(e.message);
@@ -251,17 +319,61 @@ async function loadGroups() {
         alert(e.message);
       }
     });
+    const editBtn = el("button", { class: "secondary", text: "Edit" });
+    editBtn.addEventListener("click", () => openGroupEditPanel(g));
+    const restartSummary = restartActionsSummary(g.restart_actions);
     list.appendChild(
       el("div", { class: "list-item" }, [
         el("div", { class: "stack" }, [
           el("div", { html: `<strong>${g.name}</strong>${g.auto_failover ? ' <span class="pill">auto-failover</span>' : ""}` }),
           el("div", { class: "muted tiny", text: chain }),
+          restartSummary ? el("div", { class: "muted tiny", text: `restarts: ${restartSummary}` }) : el("span"),
         ]),
-        el("div", { class: "actions" }, [badge, attachBtn, detachBtn, delBtn]),
+        el("div", { class: "actions" }, [badge, attachBtn, detachBtn, editBtn, delBtn]),
       ])
     );
   }
 }
+
+let EDITING_GROUP_ID = null;
+
+function openGroupEditPanel(g) {
+  EDITING_GROUP_ID = g.id;
+  document.getElementById("group-edit-title").textContent = g.name;
+  document.getElementById("group-edit-auto-failover").checked = !!g.auto_failover;
+  const rows = document.getElementById("group-edit-restart-rows");
+  rows.innerHTML = "";
+  for (const action of g.restart_actions || []) addRestartActionRow(rows, action);
+  document.getElementById("group-edit-panel").hidden = false;
+}
+
+document.getElementById("group-edit-add-restart-row-btn")?.addEventListener("click", () => {
+  addRestartActionRow(document.getElementById("group-edit-restart-rows"));
+});
+
+document.getElementById("group-edit-cancel-btn")?.addEventListener("click", () => {
+  document.getElementById("group-edit-panel").hidden = true;
+  EDITING_GROUP_ID = null;
+});
+
+document.getElementById("group-edit-save-btn")?.addEventListener("click", async () => {
+  if (!EDITING_GROUP_ID) return;
+  try {
+    await ajax(`/api/groups/${EDITING_GROUP_ID}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        auto_failover: document.getElementById("group-edit-auto-failover").checked,
+        restart_actions: collectRestartActions(document.getElementById("group-edit-restart-rows")),
+      }),
+    });
+    document.getElementById("group-edit-panel").hidden = true;
+    EDITING_GROUP_ID = null;
+    await loadGroups();
+  } catch (e) {
+    alert(e.message);
+  }
+});
 
 // ----------------------------------------------------------- attachments
 
@@ -332,18 +444,70 @@ async function loadAttachments() {
       }
     }
 
+    const autoBadge = el("span", {
+      class: `badge ${att.auto_failover ? "attached" : "idle"}`,
+      text: att.auto_failover ? "on" : "off",
+    });
+    const actionCells = [detachBtn, ...extraActions];
+    if (!att.group_id) {
+      const editBtn = el("button", { class: "secondary", text: "Edit" });
+      editBtn.addEventListener("click", () => openAttachmentEditPanel(att));
+      actionCells.push(editBtn);
+    }
+
     tbody.appendChild(
       el("tr", {}, [
         el("td", { text: att.port }),
         el("td", { text: att.server_name }),
         el("td", { text: att.busid }),
         el("td", { text: att.label || (att.group_id ? "(group)" : "") }),
+        el("td", {}, [autoBadge]),
         el("td", {}, [statusBadge]),
-        el("td", { class: "actions" }, [detachBtn, ...extraActions]),
+        el("td", { class: "actions" }, actionCells),
       ])
     );
   }
 }
+
+let EDITING_ATTACHMENT_PORT = null;
+
+function openAttachmentEditPanel(att) {
+  EDITING_ATTACHMENT_PORT = att.port;
+  document.getElementById("attachment-edit-title").textContent = `${att.server_name}/${att.busid} (port ${att.port})`;
+  document.getElementById("attachment-edit-auto-failover").checked = !!att.auto_failover;
+  const rows = document.getElementById("attachment-edit-restart-rows");
+  rows.innerHTML = "";
+  for (const action of att.restart_actions || []) addRestartActionRow(rows, action);
+  document.getElementById("attachment-edit-panel").hidden = false;
+}
+
+document.getElementById("attachment-edit-add-restart-row-btn")?.addEventListener("click", () => {
+  addRestartActionRow(document.getElementById("attachment-edit-restart-rows"));
+});
+
+document.getElementById("attachment-edit-cancel-btn")?.addEventListener("click", () => {
+  document.getElementById("attachment-edit-panel").hidden = true;
+  EDITING_ATTACHMENT_PORT = null;
+});
+
+document.getElementById("attachment-edit-save-btn")?.addEventListener("click", async () => {
+  if (!EDITING_ATTACHMENT_PORT) return;
+  try {
+    await ajax(`/api/attachments/${EDITING_ATTACHMENT_PORT}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        auto_failover: document.getElementById("attachment-edit-auto-failover").checked,
+        restart_actions: collectRestartActions(document.getElementById("attachment-edit-restart-rows")),
+      }),
+    });
+    document.getElementById("attachment-edit-panel").hidden = true;
+    EDITING_ATTACHMENT_PORT = null;
+    await loadAttachments();
+  } catch (e) {
+    alert(e.message);
+  }
+});
 
 document.getElementById("refresh-attachments-btn")?.addEventListener("click", loadAttachments);
 
