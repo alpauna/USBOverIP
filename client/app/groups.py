@@ -136,21 +136,33 @@ async def detach_group(group_id: str) -> None:
 
 async def _restore_dropped_attachment(port: str, att: dict) -> dict:
     """Common recovery path for one attachment that just dropped, used by
-    both the watchdog and the server-pushed reconnect notice."""
-    config.store.update(lambda d, p=port: d["attachments"].pop(p, None))
-    log_event(f"attachment on port {port} dropped (server={att.get('server_id')} busid={att.get('busid')})")
+    both the watchdog and the server-pushed reconnect notice.
+
+    Important: the record is only removed once a reattach actually
+    succeeds. A failed attempt (e.g. it fires before the server has
+    finished rebinding) leaves the record in place so the *next* watchdog
+    tick - or a later push notification - gets another chance instead of
+    silently giving up after one race-prone try."""
+    log_event(f"port {port} not attached (server={att.get('server_id')} busid={att.get('busid')}); attempting reconnect")
 
     if not att.get("auto_failover", True):
+        config.store.update(lambda d, p=port: d["attachments"].pop(p, None))
         return {"status": "dropped"}
 
     if att.get("group_id"):
+        # attach_group() refuses to run if it sees *any* attachment record
+        # for this group_id, live or not - pop the dead one first so a
+        # retry isn't permanently blocked by its own stale record, and put
+        # it back unchanged if this attempt also fails.
+        config.store.update(lambda d, p=port: d["attachments"].pop(p, None))
         try:
             result = await attach_group(att["group_id"])
-            log_event(f"auto-reconnect: reattached via {result['server']}/{result['busid']}")
-            return {"status": "reattached", **result}
         except GroupError as e:
             log_event(f"auto-reconnect failed: {e}")
+            config.store.update(lambda d, p=port, r=att: d["attachments"].__setitem__(p, r))
             return {"status": "failed", "error": str(e)}
+        log_event(f"auto-reconnect: reattached via {result['server']}/{result['busid']}")
+        return {"status": "reattached", **result}
 
     cfg = config.store.read()
     server = cfg["servers"].get(att.get("server_id"))
@@ -164,7 +176,12 @@ async def _restore_dropped_attachment(port: str, att: dict) -> dict:
         return {"status": "failed", "error": str(e)}
     now = datetime.datetime.utcnow().isoformat() + "Z"
     new_record = {**att, "attached_at": now}
-    config.store.update(lambda d, p=new_port, r=new_record: d["attachments"].__setitem__(p, r))
+
+    def _replace(d, old_port=port, new_port=new_port, record=new_record):
+        d["attachments"].pop(old_port, None)
+        d["attachments"][new_port] = record
+
+    config.store.update(_replace)
     log_event(f"auto-reconnect: reattached {server['name']}/{att['busid']} on port {new_port}")
     run_restart_actions(att.get("restart_actions", []))
     return {"status": "reattached", "port": new_port, "server": server["name"], "busid": att["busid"]}
