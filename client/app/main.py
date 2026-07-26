@@ -303,6 +303,7 @@ async def api_direct_attach(
     }
     config.store.update(lambda d, p=port, r=record: d["attachments"].__setitem__(p, r))
     groups.log_event(f"direct attach: {server['name']}/{busid} -> port {port}")
+    groups.run_restart_actions(record["restart_actions"])
     return {"port": port}
 
 
