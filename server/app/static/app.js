@@ -37,11 +37,27 @@ async function loadDevices() {
     const data = await ajax("/api/devices");
     tbody.innerHTML = "";
     empty.hidden = data.devices.length !== 0;
+
+    const serialCounts = {};
+    for (const dev of data.devices) {
+      if (dev.serial) serialCounts[dev.serial] = (serialCounts[dev.serial] || 0) + 1;
+    }
+
     for (const dev of data.devices) {
       const badge = el("span", {
         class: `badge ${dev.status}`,
         text: STATUS_LABEL[dev.status] || dev.status,
       });
+      const duplicate = dev.serial && serialCounts[dev.serial] > 1;
+      const serialCell = el("span", {
+        text: dev.serial || "—",
+        class: duplicate ? "tiny" : "muted tiny",
+      });
+      if (duplicate) {
+        serialCell.title = "This serial number is shared by more than one device - not a safe way to tell them apart";
+        serialCell.style.color = "var(--danger)";
+        serialCell.style.fontWeight = "600";
+      }
       const labelInput = el("input", { value: dev.label || "", placeholder: "optional label" });
       labelInput.addEventListener("change", async () => {
         await ajax(`/api/devices/${dev.busid}/label`, {
@@ -71,6 +87,7 @@ async function loadDevices() {
         el("td", { text: dev.busid }),
         el("td", { text: dev.description }),
         el("td", { text: `${dev.vendor_id}:${dev.product_id}` }),
+        el("td", {}, [serialCell]),
         el("td", {}, [labelInput]),
         el("td", {}, [badge]),
         el("td", {}, [actionBtn]),

@@ -29,6 +29,7 @@ class UsbDevice:
     description: str
     status: str  # unshared | shared_idle | shared_in_use | unknown
     label: str = ""
+    serial: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -41,6 +42,19 @@ def _read_status(busid: str) -> str:
     except (FileNotFoundError, OSError):
         return "unshared"
     return STATUS_MAP.get(value, "unknown")
+
+
+def _read_serial(busid: str) -> str:
+    # Not every USB device reports a serial string (many cheap hubs/devices
+    # don't) - this is best-effort. Note some devices ship with a
+    # non-unique factory-programmed serial (seen in the wild on cheap
+    # Zigbee dongle clones), so a matching serial across two busids is a
+    # real possibility worth surfacing, not necessarily a bug here.
+    try:
+        with open(f"/sys/bus/usb/devices/{busid}/serial") as f:
+            return f.read().strip()
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 def list_local_devices(labels: dict[str, str] | None = None) -> list[UsbDevice]:
@@ -72,6 +86,7 @@ def list_local_devices(labels: dict[str, str] | None = None) -> list[UsbDevice]:
                     description=desc,
                     status=_read_status(busid),
                     label=labels.get(busid, ""),
+                    serial=_read_serial(busid),
                 )
             )
             i += 2
