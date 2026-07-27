@@ -323,12 +323,49 @@ on which server is behind it right now.
 
 **How to use it** in a downstream container's `devices:` mapping - map
 the stable symlink to whatever path *that container's own config*
-already expects, e.g.:
+already expects. Here's the actual Home Assistant stack from the
+incident above, fixed - three services, three different ways their own
+config expects the device to show up, one consistent pattern:
 
 ```yaml
-devices:
-  - /dev/usbip-web/<attachment-id>:/dev/ttyUSB0   # or /dev/zwave, or whatever your app expects
+services:
+  zigbee2mqtt:
+    image: koenkk/zigbee2mqtt
+    devices:
+      # zigbee2mqtt's own adapter setting still says /dev/ttyUSB0 -
+      # give it that path, sourced from the stable symlink instead of
+      # the raw (unstable) /dev/ttyUSBx node.
+      - /dev/usbip-web/<zigbee-attachment-id>:/dev/ttyUSB0
+    volumes:
+      - ./zigbee2mqtt-data:/app/data
+    restart: unless-stopped
+
+  zwavejs2mqtt:
+    image: zwavejs/zwavejs2mqtt:latest
+    devices:
+      # zwavejs2mqtt's settings.json says /dev/zwave.
+      - /dev/usbip-web/<zwave-attachment-id>:/dev/zwave
+    volumes:
+      - ./zwave-data:/usr/src/app/store
+    restart: unless-stopped
+
+  border-router:
+    container_name: otbr
+    image: openthread/border-router
+    devices:
+      # otbr has no fixed internal path expectation of its own - it
+      # reads OT_RCP_DEVICE below, so the stable symlink can be mapped
+      # in as itself (no :targetpath needed) as long as the env var
+      # below references that exact same path.
+      - /dev/usbip-web/<thread-attachment-id>
+      - /dev/net/tun
+    environment:
+      - OT_RCP_DEVICE=spinel+hdlc+uart:///dev/usbip-web/<thread-attachment-id>?uart-baudrate=460800
+    restart: unless-stopped
 ```
+
+Get each `<...-attachment-id>` from that device's Details panel on the
+client dashboard ("Stable path": `/dev/usbip-web/<id>`).
 
 **The mistake that caused the incident above:** a bare
 `- /dev/usbip-web/<attachment-id>` (no `:targetpath`) maps the device to
