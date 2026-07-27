@@ -118,6 +118,17 @@ async def attach_group(group_id: str) -> dict:
         }
         config.store.update(lambda d, p=port, r=record: d["attachments"].__setitem__(p, r))
         log_event(f"group '{group['name']}' attached via {server['name']}/{candidate['busid']} (port {port})")
+
+        live = next((p for p in usbip_client.list_ports() if p.port == port), None)
+        dev_paths = (
+            usbip_client.resolve_device_paths(live.local_busid)
+            if live and live.local_busid
+            else {"tty": None, "by_id": [], "raw": None}
+        )
+        stable_path = usbip_client.update_group_symlink(group_id, dev_paths)
+        if stable_path:
+            log_event(f"group '{group['name']}' stable device path: {stable_path}")
+
         run_restart_actions(group.get("restart_actions", []))
         return {"port": port, "server_id": server["id"], "server": server["name"], "busid": candidate["busid"]}
 
@@ -132,6 +143,7 @@ async def detach_group(group_id: str) -> None:
         raise GroupError("group is not currently attached")
     usbip_client.detach(port)
     config.store.update(lambda d: d["attachments"].pop(port, None))
+    usbip_client.remove_group_symlink(group_id)
     log_event(f"group detached (was on port {port})")
 
 

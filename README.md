@@ -58,6 +58,14 @@ unplugging/replugging or restarting `usbipd` clears the state.
 
 ## Failover ("backup server")
 
+**Status: implemented but not yet verified end-to-end against a real
+backup server outage.** Group creation, priority ordering, and the
+watchdog's reattach-on-drop path have each been exercised individually;
+the full scenario (primary server actually goes offline while a group is
+attached, watchdog notices, backup candidate takes over, downstream
+container gets restarted) has not. Treat it as unproven until you've run
+that drill yourself once against your own hardware.
+
 A **device group** (client-side concept, `client/app/groups.py`) is a
 named, ordered list of `(server, busid)` candidates representing "the
 same logical device" across a primary and one or more backup servers -
@@ -72,6 +80,46 @@ This only helps if you actually have redundant hardware (the same device
 plugged into a backup server, or a second server holding an equivalent
 device) - it can't fail over a single physical dongle to a server it
 isn't plugged into.
+
+### USB serial numbers: what they do and don't protect against
+
+Both apps track each device's USB serial number (`/sys/bus/usb/devices/
+<busid>/serial`) alongside its busid, to self-heal when busids shift
+(Proxmox passthrough reconfig, a device's own USB reset, or a full host
+bus renumbering can all move a device to a new busid with no warning -
+see the server's `known_serials` snapshot and the client's per-server
+relocation fallback in `groups.py`). **This matching is scoped to one
+server's own device list.** A server, and each client's view of that
+server, will only ever search for a matching serial among *that same
+server's* current devices - serials are never compared *across* two
+different servers.
+
+That scoping matters for failover groups specifically:
+
+- A group candidate list is built by hand (you pick which busid on the
+  backup server corresponds to the same logical device) - the app has no
+  way to verify the primary and backup candidates are actually
+  equivalent hardware, and doesn't try to. Get the pairing right when you
+  create the group.
+- Because matching never crosses servers, a duplicate serial on the
+  backup server can't cause the primary's relocation logic to pick the
+  wrong device, or vice versa. The blast radius of a bad serial is always
+  contained to the one server it's plugged into.
+
+Within a single server, though, serial quality genuinely matters: cheap
+USB-UART bridge clones (some CH340/CP210x knockoffs in particular) are
+known to ship with a factory-programmed serial that's blank or identical
+across every unit of that batch, regardless of how many you plug into
+the same server. If two shared devices on one server share a serial, a
+busid renumbering could relocate to the wrong one. The server dashboard's
+device table already flags this - a serial that appears more than once
+in that server's list is shown in red/bold. Treat that warning as
+"relocation is unreliable for these devices," not just cosmetic; if you
+see it, check `udevadm info -a -n /dev/ttyUSBx | grep -i serial` (or the
+vendor's own config tool, if one exists) to confirm whether the dongle
+really has a duplicate serial or just isn't exposing one, and consider
+it a candidate for replacement if it's going into a failover-critical
+role.
 
 ## Security model (read this)
 

@@ -549,6 +549,18 @@ async function openAttachmentDetailsPanel(port) {
     for (const [k, v] of rows) {
       body.appendChild(el("div", { text: `${k}: ${v}` }));
     }
+    if (d.stable_path) {
+      body.appendChild(
+        el("div", {}, [
+          document.createTextNode("Stable path (survives failover): "),
+          codeField(d.stable_path),
+        ])
+      );
+    } else if (d.group_id) {
+      body.appendChild(
+        el("p", { class: "muted", text: "No stable path yet (device not live)." })
+      );
+    }
     body.appendChild(el("div", { class: "muted", text: "Device paths (for a new container's devices: mapping):" }));
     if (d.dev_paths.tty) {
       body.appendChild(el("div", {}, [document.createTextNode("Serial (tty): "), codeField(d.dev_paths.tty)]));

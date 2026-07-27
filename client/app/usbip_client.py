@@ -190,3 +190,60 @@ def resolve_device_paths(local_busid: str) -> dict:
                 continue
 
     return result
+
+
+# Where we put our own stable, app-managed symlinks for device groups (see
+# update_group_symlink below). Distinct from /dev/serial/by-id, which is
+# udev's - keyed off the physical dongle's own vendor/serial strings, so it
+# changes identity when a group fails over to a *different* dongle on a
+# backup server.
+GROUP_SYMLINK_DIR = "/dev/usbip-web"
+
+
+def update_group_symlink(group_id: str, dev_paths: dict) -> str | None:
+    """(Re)point GROUP_SYMLINK_DIR/<group_id> at whichever real device node
+    this group's current attachment produced (tty preferred - the common
+    case for this app - falling back to the raw usbfs node). Downstream
+    config (a Docker `devices:` mapping, a fixed HA path) can reference
+    this one path indefinitely across a primary/backup failover instead of
+    needing to be hand-edited every time the underlying physical dongle
+    changes. A container still needs restarting to pick up a retargeted
+    symlink (Docker resolves `devices:` to a major:minor at container
+    creation, not live) - restart_actions already handles that part.
+    Returns the stable path, or None if there's no device node yet."""
+    target = dev_paths.get("tty") or dev_paths.get("raw")
+    if not target:
+        return None
+    try:
+        os.makedirs(GROUP_SYMLINK_DIR, exist_ok=True)
+        stable_path = f"{GROUP_SYMLINK_DIR}/{group_id}"
+        tmp_path = f"{stable_path}.tmp-{os.getpid()}"
+        try:
+            os.symlink(target, tmp_path)
+            os.replace(tmp_path, stable_path)  # atomic rename of the symlink itself
+        except OSError:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        logger.exception("failed to update stable symlink for group %s", group_id)
+        return None
+    return stable_path
+
+
+def group_symlink_path(group_id: str) -> str | None:
+    """The stable path for this group, if update_group_symlink has ever
+    created it and it hasn't since been removed."""
+    path = f"{GROUP_SYMLINK_DIR}/{group_id}"
+    return path if os.path.islink(path) else None
+
+
+def remove_group_symlink(group_id: str) -> None:
+    try:
+        os.remove(f"{GROUP_SYMLINK_DIR}/{group_id}")
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.exception("failed to remove stable symlink for group %s", group_id)
