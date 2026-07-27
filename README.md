@@ -130,7 +130,11 @@ role.
   lightweight CSRF guard.
 - Clients authenticate to a server's REST API with a bearer token you
   generate from the server's dashboard and paste into the client's "Add
-  server" form. Rotating it immediately invalidates the old one.
+  server" form. Rotating it immediately invalidates the old one. **That
+  token travels in plain HTTP** (this app doesn't terminate TLS itself),
+  so anyone who can sniff the LAN between a server and client can read it
+  - see "WireGuard tunnel" below to close this off along with the next
+  point.
 - **The raw USB/IP protocol (TCP port 3240) has no authentication at
   all** - this is a property of `usbip`/`usbipd` itself, not something a
   web wrapper can add without a custom kernel driver. Anyone who can
@@ -150,6 +154,68 @@ role.
 - `passwords.hide` (your own deployment notes) and everything under
   `data/` (persisted admin password hashes, tokens, server registry) are
   gitignored. Never commit them.
+
+## WireGuard tunnel (optional)
+
+Encrypts the USB/IP wire protocol *and* the client API traffic (including
+the bearer token, which otherwise travels in plain HTTP) between a server
+and any client that opts in - see the two bolded caveats in "Security
+model" above. Off by default; nothing changes for a client that never
+enables it.
+
+**How it works:** the server is the hub (one WireGuard identity, `wg0`,
+generated automatically on first startup - inert with zero peers until a
+client joins). Each client keeps one WireGuard identity of its own but
+gets a **separate interface per server** (`wg-<server_id>`, not a shared
+`wg0`) - WireGuard's anti-spoofing check requires a client's local address
+to fall within whatever `AllowedIPs` a given server issued it, which two
+different servers' independent IP-pool assignments can't both satisfy on
+one shared address. Key exchange rides the same trust you've already
+established: registering piggybacks on the client's existing bearer
+token, so there's no public key to copy-paste by hand.
+
+**Setup procedure**, once both boxes are running an image built after this
+feature landed (`wireguard-tools`, and `nftables` on the server, are baked
+into the Dockerfiles - a normal `docker compose up -d --build` picks them
+up, nothing extra to install):
+
+1. On the **server** dashboard, nothing to do - the WireGuard card shows
+   its own public key and listen port (UDP 51820) automatically once it's
+   up. If the card doesn't appear, `wireguard-tools` isn't installed in
+   that container (rebuild the image).
+2. On the **client** dashboard, find the server in the servers list and
+   click **Enable tunnel**. This registers the client's public key with
+   that server (the server allocates it an IP from its pool, e.g.
+   `10.99.0.2`) and brings up the local `wg-<server_id>` interface. A
+   badge appears reading `tunnel up, server @ 10.99.0.1` (or similar) -
+   that address, not the client's own tunnel IP, is what belongs in the
+   Host field in step 3.
+3. Confirm the tunnel actually established before routing anything
+   through it: the badge should read `tunnel <age>, server @ ...` where
+   `<age>` is a recent handshake time, not "down". If it says "down",
+   nothing has traversed the tunnel yet - WireGuard is lazy and won't
+   handshake until the first packet tries to go through, which step 4
+   below will trigger.
+4. Click **Edit** on that same server row, replace the Host / IP field
+   with the server address shown in the badge (e.g. `10.99.0.1`), and
+   Save. From this point on, every API call and every `usbip attach` for
+   this server rides the tunnel - no other setting or code path changes.
+   Refresh the badge (or wait for the next poll) to confirm the handshake
+   age is advancing.
+5. Optional, and **only after confirming step 4 works**: on the server
+   dashboard, enable "Require WireGuard for the USB/IP port (3240)". This
+   firewalls port 3240 to the tunnel subnet + loopback so a direct-LAN
+   attach attempt is rejected - but any client whose Host field you
+   haven't switched to its tunnel IP yet loses access the moment you
+   enable it. The dashboard/API port (8000) is deliberately never
+   restricted by this toggle, both so a brand new client can still
+   bootstrap a tunnel via step 2 and so you can't lock yourself out of
+   the dashboard itself.
+
+To verify none of this is placebo: `tcpdump -i <lan-iface> port 3240 or
+port 8000` on the server while a tunneled client is active should show
+**zero** packets - only UDP traffic on the WireGuard listen port should
+appear on that interface.
 
 ## Deploying the server
 

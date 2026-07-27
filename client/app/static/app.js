@@ -65,7 +65,8 @@ function renderServers() {
       const wgBadge = el("span", {
         class: "badge idle",
         id: `wg-badge-${s.id}`,
-        text: `tunnel: ${s.wireguard.assigned_ip}`,
+        title: "Put this address in the Host / IP field above to route traffic through the tunnel",
+        text: `tunnel up, server @ ${s.wireguard.server_wg_ip}`,
       });
       actions.splice(1, 0, wgBadge);
     } else {
@@ -183,7 +184,7 @@ async function loadWireguardStatus() {
     for (const t of data.tunnels) {
       const badge = document.getElementById(`wg-badge-${t.server_id}`);
       if (!badge) continue;
-      badge.textContent = `tunnel: ${t.assigned_ip} (${t.up ? handshakeAge(t.latest_handshake) : "down"})`;
+      badge.textContent = `tunnel ${t.up ? handshakeAge(t.latest_handshake) : "down"}, server @ ${t.server_wg_ip}`;
       badge.className = `badge ${t.up ? "online" : "offline"}`;
     }
   } catch (e) {

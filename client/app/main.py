@@ -383,6 +383,7 @@ async def api_wireguard_status(user=Depends(require_session_user)):
                 "server_id": server_id,
                 "server_name": server["name"],
                 "assigned_ip": wg_state["assigned_ip"],
+                "server_wg_ip": wg_state["server_wg_ip"],
                 "up": live["up"],
                 "latest_handshake": peer["latest_handshake"] if peer else 0,
             }
