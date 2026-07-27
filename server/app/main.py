@@ -196,6 +196,12 @@ def _ensure_wireguard_up() -> None:
         wg_cfg = config.store.read()["wireguard"]
         log_event("wireguard: generated server keypair")
 
+    if not wg_cfg.get("endpoint_host"):
+        detected = wireguard_helper.detect_lan_ip()
+        config.store.update(lambda d, h=detected: d["wireguard"].update(endpoint_host=h))
+        wg_cfg = config.store.read()["wireguard"]
+        log_event(f"wireguard: auto-detected endpoint address {detected} (set SERVER_WG_ENDPOINT_HOST to override)")
+
     try:
         wireguard_helper.ensure_interface_up(
             wg_cfg["private_key"], wg_cfg["address"], listen_port=wg_cfg["listen_port"]
@@ -549,9 +555,7 @@ async def api_delete_client(client_id: str, request: Request, user=Depends(requi
 
 
 @app.post("/api/wireguard/register")
-async def api_wireguard_register(
-    request: Request, body: dict = Body(...), caller: str = Depends(require_bearer_or_session)
-):
+async def api_wireguard_register(body: dict = Body(...), caller: str = Depends(require_bearer_or_session)):
     """Called by a registered client's own backend (bearer-auth, not a
     browser) to join the tunnel - see common/wireguard_helper.py's module
     docstring for why keys don't need to be copy-pasted by hand. Not
@@ -594,7 +598,12 @@ async def api_wireguard_register(
     log_event(f"wireguard: registered peer for {caller} at {wg_ip}")
     return {
         "server_pubkey": wg_cfg["public_key"],
-        "endpoint": f"{request.url.hostname}:{wg_cfg['listen_port']}",
+        # Deliberately NOT derived from this request's own Host header - a
+        # client that's already tunneled and re-registers via its tunnel IP
+        # would otherwise get told "reach me at my own tunnel address,"
+        # which is circular. endpoint_host is a stable, real LAN address
+        # (auto-detected once at startup, see _ensure_wireguard_up).
+        "endpoint": f"{wg_cfg['endpoint_host']}:{wg_cfg['listen_port']}",
         "assigned_ip": wg_ip,
         "server_wg_ip": wg_cfg["address"].split("/")[0],
         "subnet": wg_cfg["subnet"],

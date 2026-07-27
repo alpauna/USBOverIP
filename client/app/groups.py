@@ -244,7 +244,23 @@ async def reconnect_device(server_id: str, busid: str, serial: str = "") -> dict
     `serial` (passed by the server alongside the push) lets us recognize
     a device we have an attachment for even when *our* stored busid for
     it is stale - the same relocation the server already corrected for
-    itself. Only used as a fallback when there's no direct busid match."""
+    itself. Only used as a fallback when there's no direct busid match.
+
+    Deliberately does NOT trust local port occupancy as proof the
+    connection is actually alive: this push arrives specifically because
+    the server just (re)bound this device, and - confirmed by two real
+    production incidents - that can leave an existing local attachment
+    silently dead ("zombie": vhci_hcd still reports the port as occupied,
+    but the underlying session is gone) with no way for either side to
+    notice on its own. So any existing port for this attachment gets
+    force-detached before reattaching, rather than skipped as
+    already-live. If the server also still thinks the device is in use
+    (a stale export that survived on its end too - seen when the
+    underlying transport was severed abnormally, e.g. by a firewall rule
+    dropping packets instead of resetting the connection), the reattach
+    below will fail with "device busy" and this still needs a manual
+    `usbip unbind`/`usbip bind` on the server to clear - detaching our
+    own zombie can't fix a zombie on the other end."""
     cfg = config.store.read()
     live_ports = {p.port for p in usbip_client.list_ports()}
 
@@ -252,7 +268,11 @@ async def reconnect_device(server_id: str, busid: str, serial: str = "") -> dict
         if att.get("server_id") != server_id or att.get("busid") != busid:
             continue
         if port in live_ports:
-            return {"status": "already_live", "port": port}
+            try:
+                usbip_client.detach(port)
+                log_event(f"reconnect: detached possibly-stale port {port} before reattaching")
+            except usbip_client.UsbipCommandError as e:
+                log_event(f"reconnect: could not detach possibly-stale port {port}: {e}")
         return await _restore_dropped_attachment(port, att)
 
     if serial:

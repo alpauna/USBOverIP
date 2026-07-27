@@ -52,6 +52,14 @@ def _defaults() -> dict:
             "subnet": "10.99.0.0/24",
             "next_host": 2,  # .1 is the server itself
             "peers": {},
+            # The real LAN address clients should dial to reach this box's
+            # WireGuard listen port. Deliberately NOT derived from whatever
+            # address a /register request arrived on - a client that's
+            # already tunneled and re-registers via its tunnel IP would
+            # otherwise get told "reach me at my own tunnel address," which
+            # is circular. Auto-detected once (see _ensure_wireguard_up)
+            # unless SERVER_WG_ENDPOINT_HOST is set.
+            "endpoint_host": os.environ.get("SERVER_WG_ENDPOINT_HOST", ""),
         },
         "require_wireguard": False,
     }

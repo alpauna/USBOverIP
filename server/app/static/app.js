@@ -218,11 +218,48 @@ function handshakeAge(epochSeconds) {
   return `${Math.round(ageSec / 3600)}h ago`;
 }
 
+const WG_CONNECTED_THRESHOLD_SEC = 180; // ~3 keepalive/rekey intervals
+
+function isPeerConnected(latestHandshake) {
+  return !!latestHandshake && Date.now() / 1000 - latestHandshake < WG_CONNECTED_THRESHOLD_SEC;
+}
+
+function updateSecurityNote(data) {
+  const body = document.getElementById("security-note-body");
+  if (!body) return;
+  if (!data || !data.available) return; // leave the static "not available" text as-is
+
+  body.innerHTML = "";
+  if (data.require_wireguard) {
+    body.appendChild(
+      el("p", {}, [
+        el("span", { class: "badge online", text: "WireGuard enforced" }),
+        document.createTextNode(
+          " — port 3240 is currently restricted to the WireGuard tunnel subnet and loopback only; " +
+            "direct-LAN attach attempts are rejected."
+        ),
+      ])
+    );
+  } else {
+    body.appendChild(
+      el("p", {}, [
+        el("span", { class: "badge offline", text: "WireGuard not enforced" }),
+        document.createTextNode(
+          " — the USB/IP wire protocol (TCP port 3240) has no authentication built in and is currently " +
+            "reachable directly on the LAN. Enable a tunnel and turn on \"Require WireGuard\" above, or " +
+            "restrict port 3240 at the firewall to only your known client hosts yourself."
+        ),
+      ])
+    );
+  }
+}
+
 async function loadWireguard() {
   const card = document.getElementById("wireguard-card");
   if (!card) return;
   try {
     const data = await ajax("/api/wireguard/status");
+    updateSecurityNote(data);
     if (!data.available) {
       card.hidden = true;
       return;
@@ -243,8 +280,14 @@ async function loadWireguard() {
     tbody.innerHTML = "";
     document.getElementById("wireguard-peers-empty").hidden = data.peers.length !== 0;
     for (const p of data.peers) {
+      const connected = isPeerConnected(p.latest_handshake);
+      const statusBadge = el("span", {
+        class: `badge ${connected ? "online" : "offline"}`,
+        text: connected ? "connected" : "disconnected",
+      });
       const row = el("tr", {}, [
         el("td", { text: p.client_name }),
+        el("td", {}, [statusBadge]),
         el("td", { text: p.wg_ip }),
         el("td", { text: handshakeAge(p.latest_handshake) }),
       ]);

@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import tempfile
 
 from .procutil import run, validate_endpoint, validate_ipv4_cidr, validate_wg_key
@@ -27,6 +28,24 @@ from .procutil import run, validate_endpoint, validate_ipv4_cidr, validate_wg_ke
 logger = logging.getLogger("usbip.wireguard")
 
 CONF_DIR = "/etc/wireguard"
+
+
+def detect_lan_ip() -> str:
+    """Best-effort guess at this box's own primary LAN address, for
+    advertising a WireGuard endpoint clients can actually dial. Uses the
+    "UDP connect" trick: connecting a UDP socket doesn't send any packets
+    or require real connectivity, it just asks the kernel's routing table
+    which local address it *would* use to reach that destination - so this
+    works fully offline and picks whatever interface holds the default
+    route, the same interface a client on the LAN would actually reach."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 class WireguardError(RuntimeError):

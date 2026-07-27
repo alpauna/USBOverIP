@@ -46,7 +46,7 @@
   any client that enables it, instead of relying on LAN trust alone. See the README's "Security model" section.</p>
   <div id="wireguard-info" class="stack tiny"></div>
   <table id="wireguard-peers-table">
-    <thead><tr><th>Client</th><th>Tunnel IP</th><th>Last handshake</th></tr></thead>
+    <thead><tr><th>Client</th><th>Status</th><th>Tunnel IP</th><th>Last handshake</th></tr></thead>
     <tbody></tbody>
   </table>
   <p class="muted" id="wireguard-peers-empty" hidden>No clients have joined the tunnel yet.</p>
@@ -65,8 +65,10 @@
 
 <div class="card narrow">
   <h2>Security note</h2>
-  <p class="muted">The USB/IP wire protocol itself (TCP port {{ "3240" }}) has no authentication built in &mdash;
-  this web UI only gates discovery and sharing decisions. Restrict port 3240 at the firewall to only your known client hosts.</p>
+  <div id="security-note-body">
+    <p class="muted">The USB/IP wire protocol itself (TCP port {{ "3240" }}) has no authentication built in &mdash;
+    this web UI only gates discovery and sharing decisions. Restrict port 3240 at the firewall to only your known client hosts.</p>
+  </div>
 </div>
 
 <script src="/static/app.js"></script>

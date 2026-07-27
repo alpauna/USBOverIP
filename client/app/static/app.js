@@ -61,14 +61,27 @@ function renderServers() {
     editBtn.addEventListener("click", () => openServerEditPanel(s));
 
     const actions = [badge, editBtn, del];
+    const infoLines = [
+      el("div", { class: "muted tiny", text: `${s.host}:${s.api_port} (usbip port ${s.usbip_port})` }),
+    ];
     if (s.wireguard) {
-      const wgBadge = el("span", {
-        class: "badge idle",
-        id: `wg-badge-${s.id}`,
-        title: "Put this address in the Host / IP field above to route traffic through the tunnel",
-        text: `tunnel up, server @ ${s.wireguard.server_wg_ip}`,
-      });
+      const wgBadge = el("span", { class: "badge idle", id: `wg-badge-${s.id}`, text: "tunnel: checking..." });
       actions.splice(1, 0, wgBadge);
+      infoLines.push(
+        el("div", { class: "muted tiny" }, [
+          document.createTextNode("Server tunnel IP: "),
+          codeField(s.wireguard.server_wg_ip),
+          document.createTextNode(" — put this in Host / IP (Edit) to route traffic through the tunnel"),
+        ]),
+        el("div", { class: "muted tiny" }, [
+          document.createTextNode("Client tunnel IP: "),
+          codeField(s.wireguard.assigned_ip),
+          document.createTextNode(
+            " — this client's own address on that server's tunnel; for reference/troubleshooting, " +
+              "e.g. matching it up against the server's peer list if more than one client is connected"
+          ),
+        ])
+      );
     } else {
       const enableBtn = el("button", { class: "secondary", text: "Enable tunnel" });
       enableBtn.addEventListener("click", async () => {
@@ -89,7 +102,7 @@ function renderServers() {
     const item = el("div", { class: "list-item" }, [
       el("div", { class: "stack" }, [
         el("div", { html: `<strong>${s.name}</strong> <span class="pill">${s.role}</span>` }),
-        el("div", { class: "muted tiny", text: `${s.host}:${s.api_port} (usbip port ${s.usbip_port})` }),
+        ...infoLines,
       ]),
       el("div", { class: "actions" }, actions),
     ]);
@@ -104,6 +117,20 @@ function openServerEditPanel(s) {
   document.getElementById("server-edit-title").textContent = s.name;
   document.getElementById("server-edit-host").value = s.host;
   document.getElementById("server-edit-token").value = "";
+
+  const hint = document.getElementById("server-edit-wg-hint");
+  hint.innerHTML = "";
+  if (s.wireguard) {
+    hint.appendChild(document.createTextNode("Tunnel is enabled - server tunnel IP: "));
+    hint.appendChild(codeField(s.wireguard.server_wg_ip));
+    hint.appendChild(
+      document.createTextNode(" — put that in Host / IP above to route traffic through the tunnel.")
+    );
+  } else {
+    hint.textContent =
+      'Click "Enable tunnel" on this server in the list first, then reopen Edit here to switch this to the ' +
+      "assigned tunnel IP so subsequent API + USB/IP traffic rides the tunnel instead of the LAN.";
+  }
   document.getElementById("server-edit-panel").hidden = false;
 }
 
@@ -184,7 +211,7 @@ async function loadWireguardStatus() {
     for (const t of data.tunnels) {
       const badge = document.getElementById(`wg-badge-${t.server_id}`);
       if (!badge) continue;
-      badge.textContent = `tunnel ${t.up ? handshakeAge(t.latest_handshake) : "down"}, server @ ${t.server_wg_ip}`;
+      badge.textContent = t.up ? `tunnel: ${handshakeAge(t.latest_handshake)}` : "tunnel: down";
       badge.className = `badge ${t.up ? "online" : "offline"}`;
     }
   } catch (e) {
