@@ -16,6 +16,13 @@ USBSLOT_RE = re.compile(r"^usb\d$")
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,253}$")
 CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.\-]{0,127}$")
+# WireGuard keys are a 32-byte value base64-encoded to 44 chars with one
+# trailing '=' pad - not validating the exact constrained last character,
+# just the general shape (these never reach a shell, so this is a sanity
+# check rather than an injection guard).
+WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
+IPV4_CIDR_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
+ENDPOINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,253}:\d{1,5}$")
 
 
 class ValidationError(ValueError):
@@ -69,7 +76,30 @@ def validate_port_number(port: str | int) -> int:
     return p
 
 
-def run(args: list[str], timeout: int = 20, check: bool = False) -> subprocess.CompletedProcess:
+def validate_wg_key(key: str) -> str:
+    if not isinstance(key, str) or not WG_KEY_RE.match(key):
+        raise ValidationError("invalid WireGuard key")
+    return key
+
+
+def validate_ipv4_cidr(cidr: str) -> str:
+    if not isinstance(cidr, str) or not IPV4_CIDR_RE.match(cidr):
+        raise ValidationError(f"invalid IPv4 CIDR: {cidr!r}")
+    octets, _, prefix = cidr.partition("/")
+    if any(not (0 <= int(o) <= 255) for o in octets.split(".")) or not (0 <= int(prefix) <= 32):
+        raise ValidationError(f"invalid IPv4 CIDR: {cidr!r}")
+    return cidr
+
+
+def validate_endpoint(endpoint: str) -> str:
+    if not isinstance(endpoint, str) or not ENDPOINT_RE.match(endpoint):
+        raise ValidationError(f"invalid endpoint: {endpoint!r}")
+    return endpoint
+
+
+def run(
+    args: list[str], timeout: int = 20, check: bool = False, input: str | None = None
+) -> subprocess.CompletedProcess:
     """Run a command with a list of args only. Never pass shell=True here."""
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
         raise ValidationError("args must be a list[str]")
@@ -79,4 +109,5 @@ def run(args: list[str], timeout: int = 20, check: bool = False) -> subprocess.C
         text=True,
         timeout=timeout,
         check=check,
+        input=input,
     )

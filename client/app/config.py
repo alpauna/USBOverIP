@@ -21,6 +21,17 @@ def _defaults() -> dict:
         "groups": {},
         # local_port(str) -> {server_id, busid, label, group_id, attached_at, auto_failover}
         "attachments": {},
+        # This client's own WireGuard identity - one keypair, reused across
+        # every server it tunnels to. Each server gets its own interface
+        # (wg-<server_id>, see main.py's wireguard/enable endpoint) rather
+        # than sharing one wg0, since WireGuard's anti-spoofing check
+        # requires this client's local address to fall within whatever
+        # AllowedIPs that specific server issued it - two different
+        # servers' assignments can't both be true of a single address.
+        # Per-server tunnel state (assigned IP, server pubkey/endpoint,
+        # interface name) lives on the server record itself, under its own
+        # "wireguard" key.
+        "wireguard": {"private_key": "", "public_key": ""},
     }
 
 

@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from common import wireguard_helper
 from common.procutil import ValidationError, validate_busid, validate_hostname, validate_port_number
 from common.security import PasswordTooLongError, hash_password, verify_password
 from common.webauth import LoginThrottle, require_safe_ajax, require_session_user
@@ -37,7 +38,46 @@ throttle = LoginThrottle()
 
 @app.on_event("startup")
 async def on_startup():
+    try:
+        _ensure_wireguard_tunnels_up()
+    except Exception:
+        # Same reasoning as the server's on_startup: this optional feature
+        # must never be able to block the attach/reconnect watchdog below
+        # from starting, regardless of what specific error occurs.
+        logger.exception("wireguard startup reconciliation failed; continuing without it")
     app.state.watchdog_task = asyncio.create_task(groups.watchdog_loop())
+
+
+def _ensure_wireguard_tunnels_up() -> None:
+    """Best-effort, called on every startup: for every server whose tunnel
+    was previously enabled (server record has a "wireguard" sub-object),
+    bring its dedicated interface back up and reapply its peer from
+    already-stored state - no need to re-call that server's /register,
+    since our own keypair and the server's pubkey/endpoint/assigned IP
+    were already persisted the first time. Mirrors the server's own
+    _ensure_wireguard_up startup reconcile. Never raises."""
+    if not wireguard_helper.available():
+        return
+    cfg = config.store.read()
+    wg_cfg = cfg["wireguard"]
+    if not wg_cfg.get("private_key"):
+        return  # tunnel feature was never used on this client
+    for server_id, server in cfg["servers"].items():
+        wg_state = server.get("wireguard")
+        if not wg_state:
+            continue
+        try:
+            wireguard_helper.ensure_interface_up(
+                wg_cfg["private_key"], f"{wg_state['assigned_ip']}/32", interface=wg_state["interface"]
+            )
+            wireguard_helper.apply_peer(
+                wg_state["server_pubkey"],
+                f"{wg_state['server_wg_ip']}/32",
+                endpoint=wg_state["endpoint"],
+                interface=wg_state["interface"],
+            )
+        except (wireguard_helper.WireguardError, ValidationError) as e:
+            logger.warning("could not restore wireguard tunnel for %s: %s", server["name"], e)
 
 
 @app.on_event("shutdown")
@@ -60,6 +100,7 @@ def _public_server(s: dict) -> dict:
         "usbip_port": s["usbip_port"],
         "role": s.get("role", "primary"),
         "has_token": bool(s.get("token")),
+        "wireguard": s.get("wireguard"),
     }
 
 
@@ -256,6 +297,97 @@ async def api_server_health(server_id: str, user=Depends(require_session_user)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown server")
     ok = await remote_client.check_health(server["host"], server["api_port"])
     return {"online": ok}
+
+
+@app.post("/api/servers/{server_id}/wireguard/enable")
+async def api_enable_wireguard(server_id: str, request: Request, user=Depends(require_session_user)):
+    """Joins this server's WireGuard tunnel - generates our own keypair the
+    first time (reused across every server we tunnel to), registers it
+    with the server (which allocates us an IP from its pool), then brings
+    up a dedicated local interface (wg-<server_id>, not a shared wg0 - see
+    config.py's docstring for why each server needs its own interface).
+    After this succeeds, editing this server's `host` field to its
+    assigned_ip (PUT /api/servers/{id}) routes all subsequent API + USB/IP
+    traffic through the tunnel with no other code change needed."""
+    require_safe_ajax(request)
+    if not wireguard_helper.available():
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "wireguard-tools not installed on this client")
+    cfg = config.store.read()
+    server = cfg["servers"].get(server_id)
+    if not server:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown server")
+
+    wg_cfg = cfg["wireguard"]
+    if not wg_cfg.get("private_key"):
+        try:
+            private_key, public_key = wireguard_helper.generate_keypair()
+        except wireguard_helper.WireguardError as e:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not generate keypair: {e}")
+        config.store.update(
+            lambda d, priv=private_key, pub=public_key: d["wireguard"].update(
+                private_key=priv, public_key=pub
+            )
+        )
+        wg_cfg = config.store.read()["wireguard"]
+
+    try:
+        reg = await remote_client.register_wireguard(
+            server["host"], server["api_port"], server["token"], wg_cfg["public_key"]
+        )
+    except remote_client.RemoteError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+
+    interface = f"wg-{server_id}"
+    try:
+        wireguard_helper.ensure_interface_up(
+            wg_cfg["private_key"], f"{reg['assigned_ip']}/32", interface=interface
+        )
+        wireguard_helper.apply_peer(
+            reg["server_pubkey"], f"{reg['server_wg_ip']}/32", endpoint=reg["endpoint"], interface=interface
+        )
+    except (wireguard_helper.WireguardError, ValidationError) as e:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"tunnel came up on the server but failed locally: {e}"
+        )
+
+    wg_state = {
+        "server_pubkey": reg["server_pubkey"],
+        "endpoint": reg["endpoint"],
+        "assigned_ip": reg["assigned_ip"],
+        "server_wg_ip": reg["server_wg_ip"],
+        "subnet": reg["subnet"],
+        "interface": interface,
+    }
+    config.store.update(lambda d, s=wg_state: d["servers"][server_id].__setitem__("wireguard", s))
+    groups.log_event(f"wireguard: tunnel enabled for {server['name']} ({interface}, {reg['assigned_ip']})")
+    return {"ok": True, "wireguard": wg_state}
+
+
+@app.get("/api/wireguard/status")
+async def api_wireguard_status(user=Depends(require_session_user)):
+    cfg = config.store.read()
+    available = wireguard_helper.available()
+    tunnels = []
+    for server_id, server in cfg["servers"].items():
+        wg_state = server.get("wireguard")
+        if not wg_state:
+            continue
+        live = (
+            wireguard_helper.interface_status(interface=wg_state["interface"])
+            if available
+            else {"up": False, "peers": []}
+        )
+        peer = next((p for p in live["peers"] if p["public_key"] == wg_state["server_pubkey"]), None)
+        tunnels.append(
+            {
+                "server_id": server_id,
+                "server_name": server["name"],
+                "assigned_ip": wg_state["assigned_ip"],
+                "up": live["up"],
+                "latest_handshake": peer["latest_handshake"] if peer else 0,
+            }
+        )
+    return {"available": available, "public_key": cfg["wireguard"].get("public_key", ""), "tunnels": tunnels}
 
 
 # ---------------------------------------------------------- direct attach

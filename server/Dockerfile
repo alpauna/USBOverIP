@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         usbip \
         kmod \
         usbutils \
+        iproute2 \
+        wireguard-tools \
+        nftables \
         python3 \
         python3-pip \
     && rm -rf /var/lib/apt/lists/*

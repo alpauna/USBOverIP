@@ -36,6 +36,24 @@ def _defaults() -> dict:
         # requiring an admin to notice and remap everything by hand.
         "known_serials": {},
         "server_name": os.environ.get("SERVER_NAME", "usbip-server"),
+        # Optional WireGuard tunnel (server is the hub, each registered
+        # client is a spoke) so the USB/IP wire protocol and the API
+        # bearer token don't have to travel the LAN in cleartext. Own
+        # keypair generated on first startup; `peers` (client_id -> {pubkey,
+        # wg_ip, added_at}) is populated by /api/wireguard/register and
+        # replayed onto the live interface on every startup - this dict is
+        # the single source of truth, the on-disk wg-quick conf only ever
+        # holds this box's own [Interface] section.
+        "wireguard": {
+            "private_key": "",
+            "public_key": "",
+            "listen_port": 51820,
+            "address": "10.99.0.1/24",
+            "subnet": "10.99.0.0/24",
+            "next_host": 2,  # .1 is the server itself
+            "peers": {},
+        },
+        "require_wireguard": False,
     }
 
 

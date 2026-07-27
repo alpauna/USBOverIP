@@ -40,6 +40,24 @@
   </details>
 </div>
 
+<div class="card" id="wireguard-card" hidden>
+  <div class="card-header"><h2>WireGuard tunnel</h2><button id="refresh-wireguard-btn" class="secondary">Refresh</button></div>
+  <p class="muted">Optional: encrypts the USB/IP wire protocol and the client API traffic between this server and
+  any client that enables it, instead of relying on LAN trust alone. See the README's "Security model" section.</p>
+  <div id="wireguard-info" class="stack tiny"></div>
+  <table id="wireguard-peers-table">
+    <thead><tr><th>Client</th><th>Tunnel IP</th><th>Last handshake</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="muted" id="wireguard-peers-empty" hidden>No clients have joined the tunnel yet.</p>
+  <div class="row" style="margin-top: 0.75rem;">
+    <label><input type="checkbox" id="wireguard-require-toggle"> Require WireGuard for the USB/IP port (3240)</label>
+  </div>
+  <p class="muted tiny">Off by default. Only enable this after confirming at least one client shows a recent
+  handshake above &mdash; enabling it blocks direct-LAN USB/IP attaches from any client that hasn't tunneled in,
+  including one you're mid-troubleshooting. The dashboard/API port is never restricted by this toggle.</p>
+</div>
+
 <div class="card narrow">
   <div class="card-header"><h2>Recent activity</h2><button id="refresh-events-btn" class="secondary">Refresh</button></div>
   <ul id="events-list" class="stack tiny"></ul>

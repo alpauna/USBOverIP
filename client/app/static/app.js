@@ -57,14 +57,40 @@ function renderServers() {
         alert(e.message);
       }
     });
-    const editBtn = el("button", { class: "secondary", text: "Edit token" });
+    const editBtn = el("button", { class: "secondary", text: "Edit" });
     editBtn.addEventListener("click", () => openServerEditPanel(s));
+
+    const actions = [badge, editBtn, del];
+    if (s.wireguard) {
+      const wgBadge = el("span", {
+        class: "badge idle",
+        id: `wg-badge-${s.id}`,
+        text: `tunnel: ${s.wireguard.assigned_ip}`,
+      });
+      actions.splice(1, 0, wgBadge);
+    } else {
+      const enableBtn = el("button", { class: "secondary", text: "Enable tunnel" });
+      enableBtn.addEventListener("click", async () => {
+        enableBtn.disabled = true;
+        enableBtn.textContent = "Enabling...";
+        try {
+          await ajax(`/api/servers/${s.id}/wireguard/enable`, { method: "POST" });
+          await loadServers();
+        } catch (e) {
+          alert(e.message);
+          enableBtn.disabled = false;
+          enableBtn.textContent = "Enable tunnel";
+        }
+      });
+      actions.splice(1, 0, enableBtn);
+    }
+
     const item = el("div", { class: "list-item" }, [
       el("div", { class: "stack" }, [
         el("div", { html: `<strong>${s.name}</strong> <span class="pill">${s.role}</span>` }),
         el("div", { class: "muted tiny", text: `${s.host}:${s.api_port} (usbip port ${s.usbip_port})` }),
       ]),
-      el("div", { class: "actions" }, [badge, editBtn, del]),
+      el("div", { class: "actions" }, actions),
     ]);
     list.appendChild(item);
   }
@@ -75,6 +101,7 @@ let EDITING_SERVER_ID = null;
 function openServerEditPanel(s) {
   EDITING_SERVER_ID = s.id;
   document.getElementById("server-edit-title").textContent = s.name;
+  document.getElementById("server-edit-host").value = s.host;
   document.getElementById("server-edit-token").value = "";
   document.getElementById("server-edit-panel").hidden = false;
 }
@@ -86,13 +113,16 @@ document.getElementById("server-edit-cancel-btn")?.addEventListener("click", () 
 
 document.getElementById("server-edit-save-btn")?.addEventListener("click", async () => {
   if (!EDITING_SERVER_ID) return;
+  const host = document.getElementById("server-edit-host").value.trim();
   const token = document.getElementById("server-edit-token").value.trim();
-  if (!token) return alert("Paste the new token first.");
+  if (!host) return alert("Host / IP is required.");
+  const body = { host };
+  if (token) body.token = token;
   try {
     await ajax(`/api/servers/${EDITING_SERVER_ID}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(body),
     });
     document.getElementById("server-edit-panel").hidden = true;
     EDITING_SERVER_ID = null;
@@ -138,6 +168,28 @@ document.getElementById("add-server-form")?.addEventListener("submit", async (ev
 });
 
 document.getElementById("refresh-servers-btn")?.addEventListener("click", loadServers);
+
+function handshakeAge(epochSeconds) {
+  if (!epochSeconds) return "no handshake yet";
+  const ageSec = Date.now() / 1000 - epochSeconds;
+  if (ageSec < 90) return "just now";
+  if (ageSec < 3600) return `${Math.round(ageSec / 60)}m ago`;
+  return `${Math.round(ageSec / 3600)}h ago`;
+}
+
+async function loadWireguardStatus() {
+  try {
+    const data = await ajax("/api/wireguard/status");
+    for (const t of data.tunnels) {
+      const badge = document.getElementById(`wg-badge-${t.server_id}`);
+      if (!badge) continue;
+      badge.textContent = `tunnel: ${t.assigned_ip} (${t.up ? handshakeAge(t.latest_handshake) : "down"})`;
+      badge.className = `badge ${t.up ? "online" : "offline"}`;
+    }
+  } catch (e) {
+    // best-effort - leave whatever the badges already showed
+  }
+}
 
 // ---------------------------------------------------------------- browse
 
@@ -638,7 +690,7 @@ async function loadEvents() {
 
 async function refreshAll() {
   await loadServers();
-  await Promise.all([loadGroups(), loadAttachments(), loadEvents()]);
+  await Promise.all([loadGroups(), loadAttachments(), loadEvents(), loadWireguardStatus()]);
   if (CFG.dockerAvailable) await loadDockerContainers();
 }
 
@@ -646,4 +698,5 @@ refreshAll();
 setInterval(() => {
   loadAttachments();
   loadEvents();
+  loadWireguardStatus();
 }, 8000);

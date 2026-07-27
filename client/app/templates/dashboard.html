@@ -7,6 +7,9 @@
   <div id="servers-list" class="stack"></div>
   <div id="server-edit-panel" class="add-form" hidden>
     <strong id="server-edit-title"></strong>
+    <label>Host / IP<input id="server-edit-host"></label>
+    <p class="muted tiny">After enabling a WireGuard tunnel below, switch this to the assigned tunnel IP so
+    subsequent API + USB/IP traffic rides the tunnel instead of the LAN - no other change needed.</p>
     <label>New access token<input id="server-edit-token" placeholder="paste the token from that server's dashboard"></label>
     <div class="row">
       <button type="button" id="server-edit-save-btn">Save</button>

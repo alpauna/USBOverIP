@@ -52,6 +52,30 @@ async def request_share(host: str, api_port: int, token: str, busid: str) -> Non
         raise RemoteError(f"server returned HTTP {resp.status_code}" + (f": {detail}" if detail else ""))
 
 
+async def register_wireguard(host: str, api_port: int, token: str, pubkey: str) -> dict:
+    """Joins that server's WireGuard tunnel using our own public key - see
+    common/wireguard_helper.py's module docstring for the overall design.
+    Returns {server_pubkey, endpoint, assigned_ip, server_wg_ip, subnet}."""
+    url = f"{_base_url(host, api_port)}/api/wireguard/register"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                url, headers={"Authorization": f"Bearer {token}"}, json={"pubkey": pubkey}
+            )
+    except httpx.RequestError as e:
+        raise RemoteError(f"could not reach server: {e}") from e
+    if resp.status_code == 401:
+        raise RemoteError("server rejected token (unauthorized)")
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("detail", "")
+        except Exception:
+            pass
+        raise RemoteError(f"server returned HTTP {resp.status_code}" + (f": {detail}" if detail else ""))
+    return resp.json()
+
+
 async def fetch_info(host: str, api_port: int) -> dict:
     url = f"{_base_url(host, api_port)}/api/info"
     try:

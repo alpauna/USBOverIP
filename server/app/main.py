@@ -13,7 +13,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from common.procutil import ValidationError, validate_busid, validate_hostname, validate_port_number
+from common import wireguard_helper
+from common.procutil import (
+    ValidationError,
+    validate_busid,
+    validate_hostname,
+    validate_port_number,
+    validate_wg_key,
+)
 from common.security import (
     PasswordTooLongError,
     generate_token,
@@ -22,7 +29,7 @@ from common.security import (
 )
 from common.webauth import LoginThrottle, require_safe_ajax, require_session_user
 
-from . import config
+from . import config, firewall_helper
 from .events import EVENTS, log_event
 from .usb_devices import bind_device, list_local_devices, unbind_device
 from .usbipd_supervisor import UsbipdSupervisor
@@ -49,6 +56,15 @@ supervisor = UsbipdSupervisor(port=config.USBIPD_PORT)
 async def on_startup():
     await supervisor.start()
     await _ensure_shared_devices_bound(force=True)
+    try:
+        _ensure_wireguard_up()
+    except Exception:
+        # The tunnel is an optional layer on top of USB/IP sharing, which
+        # must come up regardless - an unexpected failure here (a missing
+        # dependency, a permissions issue, anything not already handled
+        # inside _ensure_wireguard_up itself) must never block startup the
+        # way it did once in production before this try/except existed.
+        logger.exception("wireguard startup reconciliation failed; continuing without it")
     app.state.watchdog_task = asyncio.create_task(_watchdog_loop())
 
 
@@ -153,6 +169,52 @@ async def _ensure_shared_devices_bound(force: bool) -> None:
             dirty = True
     if dirty:
         config.store.update(lambda d: d.update(known_serials=new_known))
+
+
+def _ensure_wireguard_up() -> None:
+    """Best-effort, called on every startup: generate this server's own
+    keypair the first time, bring wg0 up, and replay every already-known
+    peer onto it. Never raises - an older deployed image without
+    wireguard-tools installed, or any wg failure, just means the tunnel
+    feature stays unavailable; it must not block the rest of startup."""
+    if not wireguard_helper.available():
+        logger.info("wireguard-tools not installed; tunnel feature unavailable")
+        return
+    cfg = config.store.read()
+    wg_cfg = cfg["wireguard"]
+    if not wg_cfg.get("private_key"):
+        try:
+            private_key, public_key = wireguard_helper.generate_keypair()
+        except wireguard_helper.WireguardError as e:
+            logger.warning("could not generate wireguard keypair: %s", e)
+            return
+        config.store.update(
+            lambda d, priv=private_key, pub=public_key: d["wireguard"].update(
+                private_key=priv, public_key=pub
+            )
+        )
+        wg_cfg = config.store.read()["wireguard"]
+        log_event("wireguard: generated server keypair")
+
+    try:
+        wireguard_helper.ensure_interface_up(
+            wg_cfg["private_key"], wg_cfg["address"], listen_port=wg_cfg["listen_port"]
+        )
+    except wireguard_helper.WireguardError as e:
+        log_event(f"wireguard: failed to bring up wg0: {e}")
+        return
+
+    for client_id, peer in wg_cfg.get("peers", {}).items():
+        try:
+            wireguard_helper.apply_peer(peer["pubkey"], f"{peer['wg_ip']}/32")
+        except wireguard_helper.WireguardError as e:
+            log_event(f"wireguard: failed to reapply peer for client {client_id}: {e}")
+
+    if cfg.get("require_wireguard") and firewall_helper.available():
+        try:
+            firewall_helper.enable(wg_cfg["subnet"], [config.USBIPD_PORT])
+        except firewall_helper.FirewallError as e:
+            log_event(f"wireguard: failed to reapply tunnel-only firewall rule: {e}")
 
 
 async def _watchdog_loop(interval: int = 15) -> None:
@@ -484,6 +546,117 @@ async def api_delete_client(client_id: str, request: Request, user=Depends(requi
     if client:
         log_event(f"removed client '{client['name']}'")
     return {"ok": True}
+
+
+@app.post("/api/wireguard/register")
+async def api_wireguard_register(
+    request: Request, body: dict = Body(...), caller: str = Depends(require_bearer_or_session)
+):
+    """Called by a registered client's own backend (bearer-auth, not a
+    browser) to join the tunnel - see common/wireguard_helper.py's module
+    docstring for why keys don't need to be copy-pasted by hand. Not
+    AJAX-header-guarded, same reasoning as /request-share: this is a
+    machine-to-machine call authenticated by the bearer token alone."""
+    if not caller.startswith("client:"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "must be called by a registered client")
+    client_id = caller.split(":", 1)[1]
+    if not wireguard_helper.available():
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "wireguard-tools not installed on this server")
+
+    pubkey = str(body.get("pubkey", "")).strip()
+    try:
+        validate_wg_key(pubkey)
+    except ValidationError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+    cfg = config.store.read()
+    wg_cfg = cfg["wireguard"]
+    if not wg_cfg.get("private_key"):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "server tunnel not ready yet")
+    existing = wg_cfg["peers"].get(client_id)
+    if existing and existing["pubkey"] == pubkey:
+        wg_ip = existing["wg_ip"]
+    else:
+        subnet_prefix = ".".join(wg_cfg["subnet"].split(".")[:3])
+        wg_ip = f"{subnet_prefix}.{wg_cfg['next_host']}"
+
+        def _save_peer(d, cid=client_id, pk=pubkey, ip=wg_ip):
+            d["wireguard"]["peers"][cid] = {"pubkey": pk, "wg_ip": ip, "added_at": _now()}
+            d["wireguard"]["next_host"] = d["wireguard"]["next_host"] + 1
+
+        config.store.update(_save_peer)
+
+    try:
+        wireguard_helper.apply_peer(pubkey, f"{wg_ip}/32")
+    except wireguard_helper.WireguardError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+
+    log_event(f"wireguard: registered peer for {caller} at {wg_ip}")
+    return {
+        "server_pubkey": wg_cfg["public_key"],
+        "endpoint": f"{request.url.hostname}:{wg_cfg['listen_port']}",
+        "assigned_ip": wg_ip,
+        "server_wg_ip": wg_cfg["address"].split("/")[0],
+        "subnet": wg_cfg["subnet"],
+    }
+
+
+@app.get("/api/wireguard/status")
+async def api_wireguard_status(user=Depends(require_session_user)):
+    cfg = config.store.read()
+    wg_cfg = cfg["wireguard"]
+    available = wireguard_helper.available()
+    live = wireguard_helper.interface_status() if available else {"up": False, "peers": []}
+    live_by_pubkey = {p["public_key"]: p for p in live["peers"]}
+    peers_out = []
+    for client_id, peer in wg_cfg.get("peers", {}).items():
+        client = cfg.get("clients", {}).get(client_id)
+        live_peer = live_by_pubkey.get(peer["pubkey"])
+        peers_out.append(
+            {
+                "client_id": client_id,
+                "client_name": client["name"] if client else "(deleted client)",
+                "wg_ip": peer["wg_ip"],
+                "latest_handshake": live_peer["latest_handshake"] if live_peer else 0,
+            }
+        )
+    return {
+        "available": available,
+        "up": live["up"],
+        "public_key": wg_cfg.get("public_key", ""),
+        "listen_port": wg_cfg.get("listen_port"),
+        "subnet": wg_cfg.get("subnet"),
+        "peers": peers_out,
+        "require_wireguard": cfg.get("require_wireguard", False),
+    }
+
+
+@app.post("/api/wireguard/require")
+async def api_wireguard_require(
+    request: Request, user=Depends(require_session_user), body: dict = Body(...)
+):
+    """Toggles tunnel-only enforcement for port 3240 (see
+    firewall_helper.py's docstring for why the API/dashboard port is
+    deliberately left alone). Off by default - the admin should confirm
+    at least one client's tunnel actually works (wg show a handshake)
+    before flipping this on, same "verify before you can lock yourself
+    out" caution as rotating a token mid-session."""
+    require_safe_ajax(request)
+    enabled = bool(body.get("enabled"))
+    if not firewall_helper.available():
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "nftables not installed on this server")
+    cfg = config.store.read()
+    wg_cfg = cfg["wireguard"]
+    try:
+        if enabled:
+            firewall_helper.enable(wg_cfg["subnet"], [config.USBIPD_PORT])
+        else:
+            firewall_helper.disable()
+    except firewall_helper.FirewallError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    config.store.update(lambda d, v=enabled: d.update(require_wireguard=v))
+    log_event(f"wireguard: tunnel-only enforcement for port {config.USBIPD_PORT} {'enabled' if enabled else 'disabled'}")
+    return {"ok": True, "require_wireguard": enabled}
 
 
 @app.get("/api/events")

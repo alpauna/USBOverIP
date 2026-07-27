@@ -30,6 +30,20 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+function codeField(text) {
+  const node = el("code", { text, class: "tiny" });
+  node.style.cursor = "pointer";
+  node.title = "Click to select";
+  node.addEventListener("click", () => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+  return node;
+}
+
 async function loadDevices() {
   const tbody = document.querySelector("#devices-table tbody");
   const empty = document.getElementById("devices-empty");
@@ -196,11 +210,84 @@ async function loadEvents() {
 
 document.getElementById("refresh-events-btn")?.addEventListener("click", loadEvents);
 
+function handshakeAge(epochSeconds) {
+  if (!epochSeconds) return "never";
+  const ageSec = Date.now() / 1000 - epochSeconds;
+  if (ageSec < 90) return "just now";
+  if (ageSec < 3600) return `${Math.round(ageSec / 60)}m ago`;
+  return `${Math.round(ageSec / 3600)}h ago`;
+}
+
+async function loadWireguard() {
+  const card = document.getElementById("wireguard-card");
+  if (!card) return;
+  try {
+    const data = await ajax("/api/wireguard/status");
+    if (!data.available) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+
+    const info = document.getElementById("wireguard-info");
+    info.innerHTML = "";
+    info.appendChild(el("div", { text: `Status: ${data.up ? "up" : "down"}` }));
+    if (data.public_key) {
+      info.appendChild(el("div", {}, [document.createTextNode("Public key: "), codeField(data.public_key)]));
+    }
+    if (data.listen_port) {
+      info.appendChild(el("div", { text: `Listen port: ${data.listen_port} (UDP)` }));
+    }
+
+    const tbody = document.querySelector("#wireguard-peers-table tbody");
+    tbody.innerHTML = "";
+    document.getElementById("wireguard-peers-empty").hidden = data.peers.length !== 0;
+    for (const p of data.peers) {
+      const row = el("tr", {}, [
+        el("td", { text: p.client_name }),
+        el("td", { text: p.wg_ip }),
+        el("td", { text: handshakeAge(p.latest_handshake) }),
+      ]);
+      tbody.appendChild(row);
+    }
+
+    const toggle = document.getElementById("wireguard-require-toggle");
+    toggle.checked = !!data.require_wireguard;
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+document.getElementById("refresh-wireguard-btn")?.addEventListener("click", loadWireguard);
+
+document.getElementById("wireguard-require-toggle")?.addEventListener("change", async (ev) => {
+  const enabled = ev.target.checked;
+  if (enabled && !confirm(
+    "This blocks direct-LAN USB/IP attach attempts (port 3240) from any client that hasn't joined the " +
+    "tunnel yet. Confirm at least one client shows a recent handshake above before continuing. Proceed?"
+  )) {
+    ev.target.checked = false;
+    return;
+  }
+  try {
+    await ajax("/api/wireguard/require", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+  } catch (e) {
+    ev.target.checked = !enabled;
+    alert(e.message);
+  }
+});
+
 loadDevices();
 loadClients();
 loadName();
 loadEvents();
+loadWireguard();
 setInterval(() => {
   loadDevices();
   loadEvents();
+  loadWireguard();
 }, 8000);
