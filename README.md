@@ -294,6 +294,73 @@ the device. If your HA setup instead references a fixed device path, use
 the client's "Restart container" button (Local Docker containers panel)
 after attaching so HA re-scans `/dev`.
 
+## Stable device paths for downstream containers (recommended)
+
+**Why this exists:** a raw `/dev/ttyUSBx` or `/dev/bus/usb/BBB/DDD` path
+can change on every reattach - busid relocation, a whole-bus renumbering,
+or just a normal reconnect can all hand the same logical device a
+different bus/device number. Even udev's own `/dev/serial/by-id/...`
+path, while tied to the physical dongle rather than a bus number, is
+*recreated by udev on every device add/remove event* and can momentarily
+not exist during a reattach cycle - which is enough to break a container
+that only resolves the path once at startup.
+
+This bit us for real: after a series of otherwise-routine reattach/
+relocation events, three separate downstream containers on the same
+Home Assistant box (zigbee2mqtt, zwavejs2mqtt, and an OpenThread border
+router) all broke at once, each logging "No such file or directory" for
+its serial device and looping on restart - despite the client dashboard
+showing every attachment as `Live: yes`. The devices genuinely were
+live; each container's device path just no longer pointed at anything.
+
+**What the client already gives you:** every attachment (direct or via a
+group) gets a symlink at `/dev/usbip-web/<attachment-id>`, created on
+attach and retargeted automatically on every reconnect or relocation -
+shown as "Stable path" in that attachment's Details panel. The id is
+generated once and never changes for the life of that attachment record,
+regardless of which busid, port, or (for a group) which physical dongle
+on which server is behind it right now.
+
+**How to use it** in a downstream container's `devices:` mapping - map
+the stable symlink to whatever path *that container's own config*
+already expects, e.g.:
+
+```yaml
+devices:
+  - /dev/usbip-web/<attachment-id>:/dev/ttyUSB0   # or /dev/zwave, or whatever your app expects
+```
+
+**The mistake that caused the incident above:** a bare
+`- /dev/usbip-web/<attachment-id>` (no `:targetpath`) maps the device to
+that *same path* inside the container, not to the path the app is
+actually configured to open - so `OT_RCP_DEVICE`, zwavejs2mqtt's
+`/dev/zwave` setting, or zigbee2mqtt's `/dev/ttyUSB0` adapter path all
+kept pointing at a path that no longer existed inside that container,
+even though the stable symlink itself was completely correct on the
+host. Always include the `:targetpath` half, matching whatever the
+downstream app's own config says.
+
+**If this happens again** - a container logs "No such file or
+directory" for its serial device (or loops on restart) despite the
+client dashboard showing the attachment as live:
+
+1. Confirm what's actually mapped in vs. what the app expects:
+   ```bash
+   docker inspect <container> --format '{{range .HostConfig.Devices}}{{.PathOnHost}} -> {{.PathInContainer}}{{println}}{{end}}'
+   docker exec <container> ls -la <path the app's own config expects>
+   ```
+2. Fix the `devices:` entry (or environment variable, e.g. an
+   `OT_RCP_DEVICE`-style spinel URL) to point at
+   `/dev/usbip-web/<attachment-id>:<path-the-app-expects>` - the
+   attachment id is shown as the stable path in the client's Attachment
+   Details panel.
+3. **Both `devices:` mappings and environment variables are resolved
+   once, at container creation - a plain `docker restart` will not pick
+   up the change.** Force-recreate the affected service(s):
+   ```bash
+   docker compose -p <project-name> up -d --force-recreate <service...>
+   ```
+
 ## Repository layout
 
 ```
