@@ -192,31 +192,38 @@ def resolve_device_paths(local_busid: str) -> dict:
     return result
 
 
-# Where we put our own stable, app-managed symlinks for device groups (see
-# update_group_symlink below). Distinct from /dev/serial/by-id, which is
-# udev's - keyed off the physical dongle's own vendor/serial strings, so it
-# changes identity when a group fails over to a *different* dongle on a
-# backup server.
-GROUP_SYMLINK_DIR = "/dev/usbip-web"
+# Where we put our own stable, app-managed symlinks for attachments (see
+# update_attachment_symlink below). Distinct from /dev/serial/by-id, which
+# is udev's - keyed off the physical dongle's own vendor/serial strings,
+# so it changes identity whenever the underlying dongle changes (a group
+# failing over to a backup server, or - since busids/ports are not stable
+# identifiers - even a direct attachment relocating after a bus
+# renumbering or reconnecting on a fresh port).
+SYMLINK_DIR = "/dev/usbip-web"
 
 
-def update_group_symlink(group_id: str, dev_paths: dict) -> str | None:
-    """(Re)point GROUP_SYMLINK_DIR/<group_id> at whichever real device node
-    this group's current attachment produced (tty preferred - the common
-    case for this app - falling back to the raw usbfs node). Downstream
-    config (a Docker `devices:` mapping, a fixed HA path) can reference
-    this one path indefinitely across a primary/backup failover instead of
-    needing to be hand-edited every time the underlying physical dongle
-    changes. A container still needs restarting to pick up a retargeted
-    symlink (Docker resolves `devices:` to a major:minor at container
-    creation, not live) - restart_actions already handles that part.
-    Returns the stable path, or None if there's no device node yet."""
+def update_attachment_symlink(key: str, dev_paths: dict) -> str | None:
+    """(Re)point SYMLINK_DIR/<key> at whichever real device node this
+    attachment's current session produced (tty preferred - the common
+    case for this app - falling back to the raw usbfs node). `key` is
+    whatever stable identity the caller has for "this logical attachment"
+    across relocation - a group's own id for group attachments (stable
+    across a primary/backup failover to a different physical dongle), or
+    a direct attachment's own generated id (stable across busid/port
+    changes on reconnect - see groups.py's id-keyed attachment records).
+    Downstream config (a Docker `devices:` mapping, a fixed HA path) can
+    reference this one path indefinitely instead of needing to be
+    hand-edited every time the underlying device node changes. A
+    container still needs restarting to pick up a retargeted symlink
+    (Docker resolves `devices:` to a major:minor at container creation,
+    not live) - restart_actions already handles that part. Returns the
+    stable path, or None if there's no device node yet."""
     target = dev_paths.get("tty") or dev_paths.get("raw")
     if not target:
         return None
     try:
-        os.makedirs(GROUP_SYMLINK_DIR, exist_ok=True)
-        stable_path = f"{GROUP_SYMLINK_DIR}/{group_id}"
+        os.makedirs(SYMLINK_DIR, exist_ok=True)
+        stable_path = f"{SYMLINK_DIR}/{key}"
         tmp_path = f"{stable_path}.tmp-{os.getpid()}"
         try:
             os.symlink(target, tmp_path)
@@ -228,21 +235,21 @@ def update_group_symlink(group_id: str, dev_paths: dict) -> str | None:
                 pass
             raise
     except OSError:
-        logger.exception("failed to update stable symlink for group %s", group_id)
+        logger.exception("failed to update stable symlink for %s", key)
         return None
     return stable_path
 
 
-def group_symlink_path(group_id: str) -> str | None:
-    """The stable path for this group, if update_group_symlink has ever
+def attachment_symlink_path(key: str) -> str | None:
+    """The stable path for this key, if update_attachment_symlink has ever
     created it and it hasn't since been removed."""
-    path = f"{GROUP_SYMLINK_DIR}/{group_id}"
+    path = f"{SYMLINK_DIR}/{key}"
     return path if os.path.islink(path) else None
 
 
-def remove_group_symlink(group_id: str) -> None:
+def remove_attachment_symlink(key: str) -> None:
     try:
-        os.remove(f"{GROUP_SYMLINK_DIR}/{group_id}")
+        os.remove(f"{SYMLINK_DIR}/{key}")
     except FileNotFoundError:
         pass
     except OSError:

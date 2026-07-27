@@ -483,11 +483,16 @@ async function loadAttachments() {
   if (CFG.proxmoxAvailable) vms = await loadProxmoxVms();
 
   for (const att of data.attachments) {
-    const statusBadge = el("span", { class: `badge ${att.live ? "attached" : "offline"}`, text: att.live ? "active" : "stale" });
+    const backingOff = !att.live && att.next_retry_at && new Date(att.next_retry_at) > new Date();
+    const statusBadge = el("span", {
+      class: `badge ${att.live ? "attached" : "offline"}`,
+      text: att.live ? "active" : backingOff ? `stale (retrying later, ${att.failure_count}x failed)` : "stale",
+      title: backingOff ? `Next automatic retry: ${new Date(att.next_retry_at).toLocaleString()}` : "",
+    });
     const detachBtn = el("button", { class: "secondary", text: "Detach" });
     detachBtn.addEventListener("click", async () => {
       try {
-        await ajax(`/api/attachments/${att.port}/detach`, { method: "POST" });
+        await ajax(`/api/attachments/${att.id}/detach`, { method: "POST" });
         await loadAttachments();
       } catch (e) {
         alert(e.message);
@@ -500,7 +505,7 @@ async function loadAttachments() {
         const removeBtn = el("button", { class: "secondary", text: `Remove from VM ${att.proxmox.vmid}` });
         removeBtn.addEventListener("click", async () => {
           try {
-            await ajax(`/api/attachments/${att.port}/proxmox-detach`, { method: "POST" });
+            await ajax(`/api/attachments/${att.id}/proxmox-detach`, { method: "POST" });
             await loadAttachments();
           } catch (e) {
             alert(e.message);
@@ -514,7 +519,7 @@ async function loadAttachments() {
         sendBtn.addEventListener("click", async () => {
           if (!vmSelect.value) return alert("No VM selected.");
           try {
-            await ajax(`/api/attachments/${att.port}/proxmox-attach`, {
+            await ajax(`/api/attachments/${att.id}/proxmox-attach`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ vmid: vmSelect.value }),
@@ -533,7 +538,7 @@ async function loadAttachments() {
       text: att.auto_failover ? "on" : "off",
     });
     const detailsBtn = el("button", { class: "secondary", text: "Details" });
-    detailsBtn.addEventListener("click", () => openAttachmentDetailsPanel(att.port));
+    detailsBtn.addEventListener("click", () => openAttachmentDetailsPanel(att));
     const actionCells = [detailsBtn, detachBtn, ...extraActions];
     if (!att.group_id) {
       const editBtn = el("button", { class: "secondary", text: "Edit" });
@@ -555,10 +560,10 @@ async function loadAttachments() {
   }
 }
 
-let EDITING_ATTACHMENT_PORT = null;
+let EDITING_ATTACHMENT_ID = null;
 
 function openAttachmentEditPanel(att) {
-  EDITING_ATTACHMENT_PORT = att.port;
+  EDITING_ATTACHMENT_ID = att.id;
   document.getElementById("attachment-edit-title").textContent = `${att.server_name}/${att.busid} (port ${att.port})`;
   document.getElementById("attachment-edit-label").value = att.label || "";
   document.getElementById("attachment-edit-auto-failover").checked = !!att.auto_failover;
@@ -574,13 +579,13 @@ document.getElementById("attachment-edit-add-restart-row-btn")?.addEventListener
 
 document.getElementById("attachment-edit-cancel-btn")?.addEventListener("click", () => {
   document.getElementById("attachment-edit-panel").hidden = true;
-  EDITING_ATTACHMENT_PORT = null;
+  EDITING_ATTACHMENT_ID = null;
 });
 
 document.getElementById("attachment-edit-save-btn")?.addEventListener("click", async () => {
-  if (!EDITING_ATTACHMENT_PORT) return;
+  if (!EDITING_ATTACHMENT_ID) return;
   try {
-    await ajax(`/api/attachments/${EDITING_ATTACHMENT_PORT}`, {
+    await ajax(`/api/attachments/${EDITING_ATTACHMENT_ID}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -590,7 +595,7 @@ document.getElementById("attachment-edit-save-btn")?.addEventListener("click", a
       }),
     });
     document.getElementById("attachment-edit-panel").hidden = true;
-    EDITING_ATTACHMENT_PORT = null;
+    EDITING_ATTACHMENT_ID = null;
     await loadAttachments();
   } catch (e) {
     alert(e.message);
@@ -611,15 +616,15 @@ function codeField(text) {
   return node;
 }
 
-async function openAttachmentDetailsPanel(port) {
+async function openAttachmentDetailsPanel(att) {
   const panel = document.getElementById("attachment-details-panel");
   const body = document.getElementById("attachment-details-body");
-  document.getElementById("attachment-details-title").textContent = `Port ${port}`;
+  document.getElementById("attachment-details-title").textContent = `Port ${att.port}`;
   body.innerHTML = "";
   body.appendChild(el("p", { class: "muted", text: "Loading..." }));
   panel.hidden = false;
   try {
-    const d = await ajax(`/api/attachments/${port}/details`);
+    const d = await ajax(`/api/attachments/${att.id}/details`);
     body.innerHTML = "";
     const rows = [
       ["Server", `${d.server_name} / ${d.busid}`],
@@ -632,13 +637,18 @@ async function openAttachmentDetailsPanel(port) {
     if (d.stable_path) {
       body.appendChild(
         el("div", {}, [
-          document.createTextNode("Stable path (survives failover): "),
+          document.createTextNode("Stable path (survives reconnects/relocation" + (d.group_id ? "/failover" : "") + "): "),
           codeField(d.stable_path),
         ])
       );
-    } else if (d.group_id) {
+    } else {
       body.appendChild(
-        el("p", { class: "muted", text: "No stable path yet (device not live)." })
+        el("p", {
+          class: "muted",
+          text: d.live
+            ? "No stable path yet - it's created on the next attach/reconnect; refresh shortly."
+            : "No stable path yet (device not live).",
+        })
       );
     }
     body.appendChild(el("div", { class: "muted", text: "Device paths (for a new container's devices: mapping):" }));

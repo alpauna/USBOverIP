@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import uuid
 from collections import deque
 
 from . import config, docker_helper, remote_client, systemd_helper, usbip_client
@@ -32,6 +33,18 @@ from . import config, docker_helper, remote_client, systemd_helper, usbip_client
 logger = logging.getLogger("usbip.client.groups")
 
 EVENTS: deque[dict] = deque(maxlen=50)
+
+# Backoff for the watchdog's blind polling of a repeatedly-failing
+# attachment (e.g. a device that's physically unplugged): after
+# BACKOFF_THRESHOLD consecutive reconnect failures, space out further
+# *watchdog-driven* attempts exponentially instead of hammering every
+# watchdog tick forever. A server-pushed reconnect notice always bypasses
+# this - it only fires when the server itself just changed something
+# (rebound the device, an admin re-shared it), which is a concrete reason
+# to try again regardless of recent history, not blind repetition.
+BACKOFF_THRESHOLD = 3
+BACKOFF_BASE_SECONDS = 60
+BACKOFF_MAX_SECONDS = 1800
 
 
 class GroupError(Exception):
@@ -41,6 +54,45 @@ class GroupError(Exception):
 def log_event(message: str) -> None:
     EVENTS.appendleft({"time": datetime.datetime.utcnow().isoformat() + "Z", "message": message})
     logger.info(message)
+
+
+def _note_reconnect_failure(att_id: str) -> None:
+    def _bump(d, i=att_id):
+        att = d["attachments"].get(i)
+        if not att:
+            return
+        count = att.get("failure_count", 0) + 1
+        att["failure_count"] = count
+        if count >= BACKOFF_THRESHOLD:
+            delay = min(BACKOFF_BASE_SECONDS * (2 ** (count - BACKOFF_THRESHOLD)), BACKOFF_MAX_SECONDS)
+            next_retry = datetime.datetime.utcnow() + datetime.timedelta(seconds=delay)
+            att["next_retry_at"] = next_retry.isoformat() + "Z"
+            log_event(
+                f"{att.get('label') or att.get('busid')}: {count} consecutive reconnect failures, "
+                f"backing off the watchdog for {delay}s (a server push still retries immediately)"
+            )
+
+    config.store.update(_bump)
+
+
+def _note_reconnect_success(att_id: str) -> None:
+    def _reset(d, i=att_id):
+        att = d["attachments"].get(i)
+        if att and (att.get("failure_count") or att.get("next_retry_at")):
+            att["failure_count"] = 0
+            att["next_retry_at"] = None
+
+    config.store.update(_reset)
+
+
+def _watchdog_should_skip(att: dict) -> bool:
+    next_retry_at = att.get("next_retry_at")
+    if not next_retry_at:
+        return False
+    try:
+        return datetime.datetime.fromisoformat(next_retry_at.rstrip("Z")) > datetime.datetime.utcnow()
+    except ValueError:
+        return False
 
 
 def run_restart_actions(actions: list[dict] | None) -> None:
@@ -62,6 +114,20 @@ def run_restart_actions(actions: list[dict] | None) -> None:
             log_event(f"failed to restart {kind} '{name}': {e}")
 
 
+def update_symlink_for_port(key: str, port: str) -> str | None:
+    """Resolve whatever device node `port` currently produced and (re)point
+    the stable symlink for `key` at it - shared by group attach, direct
+    attach, and reconnect, so all three keep the same symlink in sync the
+    same way."""
+    live = next((p for p in usbip_client.list_ports() if p.port == port), None)
+    dev_paths = (
+        usbip_client.resolve_device_paths(live.local_busid)
+        if live and live.local_busid
+        else {"tty": None, "by_id": [], "raw": None}
+    )
+    return usbip_client.update_attachment_symlink(key, dev_paths)
+
+
 async def _candidate_status(server: dict, busid: str) -> tuple[bool, str, str]:
     try:
         devices = await remote_client.fetch_devices(server["host"], server["api_port"], server["token"])
@@ -75,10 +141,10 @@ async def _candidate_status(server: dict, busid: str) -> tuple[bool, str, str]:
     return False, "device not currently shared on that server", ""
 
 
-def _active_port_for_group(cfg: dict, group_id: str) -> str | None:
-    for port, att in cfg["attachments"].items():
+def _active_attachment_for_group(cfg: dict, group_id: str) -> tuple[str, dict] | None:
+    for att_id, att in cfg["attachments"].items():
         if att.get("group_id") == group_id:
-            return port
+            return att_id, att
     return None
 
 
@@ -87,7 +153,7 @@ async def attach_group(group_id: str) -> dict:
     group = cfg["groups"].get(group_id)
     if not group:
         raise GroupError("unknown group")
-    if _active_port_for_group(cfg, group_id):
+    if _active_attachment_for_group(cfg, group_id):
         raise GroupError("group is already attached")
 
     errors: list[str] = []
@@ -106,7 +172,9 @@ async def attach_group(group_id: str) -> dict:
             errors.append(f"{server['name']}/{candidate['busid']}: {e}")
             continue
         now = datetime.datetime.utcnow().isoformat() + "Z"
+        att_id = uuid.uuid4().hex[:8]
         record = {
+            "id": att_id,
             "server_id": server["id"],
             "busid": candidate["busid"],
             "serial": serial,
@@ -115,17 +183,12 @@ async def attach_group(group_id: str) -> dict:
             "attached_at": now,
             "auto_failover": bool(group.get("auto_failover", True)),
             "restart_actions": [],  # group-level actions are run below, not stored per-attachment
+            "port": port,
         }
-        config.store.update(lambda d, p=port, r=record: d["attachments"].__setitem__(p, r))
+        config.store.update(lambda d, i=att_id, r=record: d["attachments"].__setitem__(i, r))
         log_event(f"group '{group['name']}' attached via {server['name']}/{candidate['busid']} (port {port})")
 
-        live = next((p for p in usbip_client.list_ports() if p.port == port), None)
-        dev_paths = (
-            usbip_client.resolve_device_paths(live.local_busid)
-            if live and live.local_busid
-            else {"tty": None, "by_id": [], "raw": None}
-        )
-        stable_path = usbip_client.update_group_symlink(group_id, dev_paths)
+        stable_path = update_symlink_for_port(group_id, port)
         if stable_path:
             log_event(f"group '{group['name']}' stable device path: {stable_path}")
 
@@ -138,28 +201,40 @@ async def attach_group(group_id: str) -> dict:
 
 async def detach_group(group_id: str) -> None:
     cfg = config.store.read()
-    port = _active_port_for_group(cfg, group_id)
-    if not port:
+    found = _active_attachment_for_group(cfg, group_id)
+    if not found:
         raise GroupError("group is not currently attached")
+    att_id, att = found
+    port = att["port"]
     usbip_client.detach(port)
-    config.store.update(lambda d: d["attachments"].pop(port, None))
-    usbip_client.remove_group_symlink(group_id)
+    config.store.update(lambda d, i=att_id: d["attachments"].pop(i, None))
+    usbip_client.remove_attachment_symlink(group_id)
     log_event(f"group detached (was on port {port})")
 
 
-async def _restore_dropped_attachment(port: str, att: dict) -> dict:
+async def _restore_dropped_attachment(att_id: str, att: dict) -> dict:
     """Common recovery path for one attachment that just dropped, used by
     both the watchdog and the server-pushed reconnect notice.
+
+    Keyed by att_id, a stable id generated once when the attachment was
+    first created - NOT by local vhci port number. Port numbers are a
+    small, reused integer space the kernel assigns dynamically; keying by
+    port meant that when two attachments dropped and reconnected around
+    the same time, a freshly-reattached one could be handed a port number
+    that collided with another attachment's still-pending record under
+    that same key, silently destroying it (a real incident). The port is
+    now just a field on the record, updated in place on every reattach.
 
     Important: the record is only removed once a reattach actually
     succeeds. A failed attempt (e.g. it fires before the server has
     finished rebinding) leaves the record in place so the *next* watchdog
     tick - or a later push notification - gets another chance instead of
     silently giving up after one race-prone try."""
+    port = att.get("port")
     log_event(f"port {port} not attached (server={att.get('server_id')} busid={att.get('busid')}); attempting reconnect")
 
     if not att.get("auto_failover", True):
-        config.store.update(lambda d, p=port: d["attachments"].pop(p, None))
+        config.store.update(lambda d, i=att_id: d["attachments"].pop(i, None))
         return {"status": "dropped"}
 
     if att.get("group_id"):
@@ -167,12 +242,13 @@ async def _restore_dropped_attachment(port: str, att: dict) -> dict:
         # for this group_id, live or not - pop the dead one first so a
         # retry isn't permanently blocked by its own stale record, and put
         # it back unchanged if this attempt also fails.
-        config.store.update(lambda d, p=port: d["attachments"].pop(p, None))
+        config.store.update(lambda d, i=att_id: d["attachments"].pop(i, None))
         try:
             result = await attach_group(att["group_id"])
         except GroupError as e:
             log_event(f"auto-reconnect failed: {e}")
-            config.store.update(lambda d, p=port, r=att: d["attachments"].__setitem__(p, r))
+            config.store.update(lambda d, i=att_id, r=att: d["attachments"].__setitem__(i, r))
+            _note_reconnect_failure(att_id)
             return {"status": "failed", "error": str(e)}
         log_event(f"auto-reconnect: reattached via {result['server']}/{result['busid']}")
         return {"status": "reattached", **result}
@@ -181,6 +257,7 @@ async def _restore_dropped_attachment(port: str, att: dict) -> dict:
     server = cfg["servers"].get(att.get("server_id"))
     if not server:
         log_event(f"auto-reconnect failed: server {att.get('server_id')} is no longer registered")
+        _note_reconnect_failure(att_id)
         return {"status": "failed", "error": "server not registered"}
 
     target_busid = att["busid"]
@@ -195,6 +272,7 @@ async def _restore_dropped_attachment(port: str, att: dict) -> dict:
         relocated_busid = await _find_relocated_busid(server, att.get("serial"), target_busid)
         if not relocated_busid:
             log_event(f"auto-reconnect failed for {server['name']}/{target_busid}: {e}")
+            _note_reconnect_failure(att_id)
             return {"status": "failed", "error": str(e)}
         log_event(
             f"{server['name']}/{target_busid} not found; relocated to {relocated_busid} "
@@ -204,18 +282,20 @@ async def _restore_dropped_attachment(port: str, att: dict) -> dict:
             new_port = usbip_client.attach(server["host"], server["usbip_port"], relocated_busid)
         except usbip_client.UsbipCommandError as e2:
             log_event(f"auto-reconnect failed for {server['name']}/{relocated_busid}: {e2}")
+            _note_reconnect_failure(att_id)
             return {"status": "failed", "error": str(e2)}
         target_busid = relocated_busid
 
     now = datetime.datetime.utcnow().isoformat() + "Z"
-    new_record = {**att, "busid": target_busid, "attached_at": now}
-
-    def _replace(d, old_port=port, new_port=new_port, record=new_record):
-        d["attachments"].pop(old_port, None)
-        d["attachments"][new_port] = record
-
-    config.store.update(_replace)
+    new_record = {**att, "busid": target_busid, "attached_at": now, "port": new_port}
+    config.store.update(lambda d, i=att_id, r=new_record: d["attachments"].__setitem__(i, r))
+    _note_reconnect_success(att_id)
     log_event(f"auto-reconnect: reattached {server['name']}/{target_busid} on port {new_port}")
+
+    stable_path = update_symlink_for_port(att_id, new_port)
+    if stable_path:
+        log_event(f"{server['name']}/{target_busid} stable device path: {stable_path}")
+
     run_restart_actions(att.get("restart_actions", []))
     return {"status": "reattached", "port": new_port, "server": server["name"], "busid": target_busid}
 
@@ -264,25 +344,26 @@ async def reconnect_device(server_id: str, busid: str, serial: str = "") -> dict
     cfg = config.store.read()
     live_ports = {p.port for p in usbip_client.list_ports()}
 
-    for port, att in cfg["attachments"].items():
+    for att_id, att in cfg["attachments"].items():
         if att.get("server_id") != server_id or att.get("busid") != busid:
             continue
+        port = att.get("port")
         if port in live_ports:
             try:
                 usbip_client.detach(port)
                 log_event(f"reconnect: detached possibly-stale port {port} before reattaching")
             except usbip_client.UsbipCommandError as e:
                 log_event(f"reconnect: could not detach possibly-stale port {port}: {e}")
-        return await _restore_dropped_attachment(port, att)
+        return await _restore_dropped_attachment(att_id, att)
 
     if serial:
-        for port, att in cfg["attachments"].items():
+        for att_id, att in cfg["attachments"].items():
             if att.get("server_id") != server_id or att.get("serial") != serial:
                 continue
-            if port in live_ports:
+            if att.get("port") in live_ports:
                 continue  # something else is already live on this port
-            config.store.update(lambda d, p=port, b=busid: d["attachments"][p].__setitem__("busid", b))
-            return await _restore_dropped_attachment(port, {**att, "busid": busid})
+            config.store.update(lambda d, i=att_id, b=busid: d["attachments"][i].__setitem__("busid", b))
+            return await _restore_dropped_attachment(att_id, {**att, "busid": busid})
 
     return None
 
@@ -290,10 +371,12 @@ async def reconnect_device(server_id: str, busid: str, serial: str = "") -> dict
 async def _watchdog_tick() -> None:
     cfg = config.store.read()
     active_ports = {p.port for p in usbip_client.list_ports()}
-    for port, att in list(cfg["attachments"].items()):
-        if port in active_ports:
+    for att_id, att in list(cfg["attachments"].items()):
+        if att.get("port") in active_ports:
             continue
-        await _restore_dropped_attachment(port, att)
+        if _watchdog_should_skip(att):
+            continue
+        await _restore_dropped_attachment(att_id, att)
 
 
 async def watchdog_loop(interval: int = 15) -> None:

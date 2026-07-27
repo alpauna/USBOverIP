@@ -82,7 +82,12 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--bord
 .token-box { font-family: monospace; background: var(--bg); border: 1px dashed var(--border); padding: 10px; border-radius: 6px; margin: 8px 0; word-break: break-all; }
 .row { display: flex; gap: 8px; align-items: center; }
 .row input { flex: 1; }
-select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text); }
+select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
+/* `background: transparent` on <select> only affects the closed control -
+   the open options popup uses the browser's own default background
+   (usually white) unless <option> is styled explicitly, which left dark-
+   mode's light text unreadable against it. */
+select option { background: var(--bg); color: var(--text); }
 .list-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); gap: 10px; }
 .list-item:last-child { border-bottom: none; }
 .pill { padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; background: var(--border); }

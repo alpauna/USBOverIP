@@ -36,8 +36,62 @@ templates = Jinja2Templates(directory="app/templates")
 throttle = LoginThrottle()
 
 
+def _migrate_attachments_to_id_keys() -> None:
+    """One-time migration: attachments used to be keyed by local vhci port
+    number - a small, reused integer space the kernel assigns dynamically.
+    When two attachments dropped and reconnected around the same time, a
+    freshly-reattached one could be handed a port number that collided
+    with another attachment's still-pending record under that same key,
+    silently destroying it (a real production incident). Re-keys by a
+    stable generated id instead, moving the old port-number key into an
+    explicit "port" field on the record. Idempotent - a no-op once every
+    record already has an "id"."""
+    cfg = config.store.read()
+    migrated = {}
+    dirty = False
+    for key, att in cfg["attachments"].items():
+        if "id" in att:
+            migrated[key] = att
+            continue
+        new_id = uuid.uuid4().hex[:8]
+        migrated[new_id] = {**att, "id": new_id, "port": key}
+        dirty = True
+    if dirty:
+        config.store.update(lambda d, m=migrated: d.update(attachments=m))
+        logger.info("migrated %d attachment(s) from port-keyed to id-keyed schema", len(migrated))
+
+
+def _ensure_attachment_symlinks() -> None:
+    """Best-effort, called on every startup: any attachment that's
+    currently live but has no stable symlink yet - e.g. one that existed
+    before the symlink feature shipped, migrated straight across by
+    _migrate_attachments_to_id_keys with no attach/reconnect cycle to
+    trigger creating one - gets it created now instead of waiting for its
+    next drop/reconnect. Never raises."""
+    cfg = config.store.read()
+    active_ports = {p.port for p in usbip_client.list_ports()}
+    for att_id, att in cfg["attachments"].items():
+        port = att.get("port")
+        if port not in active_ports:
+            continue
+        key = att.get("group_id") or att_id
+        if usbip_client.attachment_symlink_path(key):
+            continue
+        stable_path = groups.update_symlink_for_port(key, port)
+        if stable_path:
+            logger.info("created missing stable symlink for existing attachment %s: %s", att_id, stable_path)
+
+
 @app.on_event("startup")
 async def on_startup():
+    try:
+        _migrate_attachments_to_id_keys()
+    except Exception:
+        logger.exception("attachment id migration failed; continuing with existing data")
+    try:
+        _ensure_attachment_symlinks()
+    except Exception:
+        logger.exception("attachment symlink reconciliation failed; continuing without it")
     try:
         _ensure_wireguard_tunnels_up()
     except Exception:
@@ -451,7 +505,9 @@ async def api_direct_attach(
     # Devices "Attach" button never prompts for one. An explicit label in
     # the request body still wins.
     default_label = str(body.get("label") or device.get("label") or "")[:80]
+    att_id = uuid.uuid4().hex[:8]
     record = {
+        "id": att_id,
         "server_id": server_id,
         "busid": busid,
         "serial": device.get("serial", ""),
@@ -460,11 +516,17 @@ async def api_direct_attach(
         "attached_at": _now(),
         "auto_failover": bool(body.get("auto_failover", True)),
         "restart_actions": _clean_restart_actions(body.get("restart_actions")),
+        "port": port,
     }
-    config.store.update(lambda d, p=port, r=record: d["attachments"].__setitem__(p, r))
+    config.store.update(lambda d, i=att_id, r=record: d["attachments"].__setitem__(i, r))
     groups.log_event(f"direct attach: {server['name']}/{busid} -> port {port}")
+
+    stable_path = groups.update_symlink_for_port(att_id, port)
+    if stable_path:
+        groups.log_event(f"{server['name']}/{busid} stable device path: {stable_path}")
+
     groups.run_restart_actions(record["restart_actions"])
-    return {"port": port}
+    return {"port": port, "id": att_id}
 
 
 def _now() -> str:
@@ -478,10 +540,12 @@ async def api_attachments(user=Depends(require_session_user)):
     cfg = config.store.read()
     live_ports = {p.port: p for p in usbip_client.list_ports()}
     out = []
-    for port, att in cfg["attachments"].items():
+    for att_id, att in cfg["attachments"].items():
         server = cfg["servers"].get(att["server_id"])
+        port = att.get("port")
         out.append(
             {
+                "id": att_id,
                 "port": port,
                 "server_id": att["server_id"],
                 "server_name": server["name"] if server else "(deleted server)",
@@ -490,23 +554,26 @@ async def api_attachments(user=Depends(require_session_user)):
                 "local_busid": live_ports[port].local_busid if port in live_ports else None,
                 "label": att.get("label") or "",
                 "group_id": att.get("group_id"),
-                "stable_path": usbip_client.group_symlink_path(att["group_id"]) if att.get("group_id") else None,
+                "stable_path": usbip_client.attachment_symlink_path(att.get("group_id") or att_id),
                 "attached_at": att.get("attached_at"),
                 "auto_failover": att.get("auto_failover", False),
                 "restart_actions": att.get("restart_actions", []),
                 "proxmox": att.get("proxmox"),
                 "live": port in live_ports,
+                "failure_count": att.get("failure_count", 0),
+                "next_retry_at": att.get("next_retry_at"),
             }
         )
     return {"attachments": out}
 
 
-@app.get("/api/attachments/{port}/details")
-async def api_attachment_details(port: str, user=Depends(require_session_user)):
+@app.get("/api/attachments/{att_id}/details")
+async def api_attachment_details(att_id: str, user=Depends(require_session_user)):
     cfg = config.store.read()
-    att = cfg["attachments"].get(port)
+    att = cfg["attachments"].get(att_id)
     if not att:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such attachment")
+    port = att.get("port")
     live_port = next((p for p in usbip_client.list_ports() if p.port == port), None)
     local_busid = live_port.local_busid if live_port else None
     dev_paths = usbip_client.resolve_device_paths(local_busid) if local_busid else {
@@ -516,6 +583,7 @@ async def api_attachment_details(port: str, user=Depends(require_session_user)):
     }
     server = cfg["servers"].get(att["server_id"])
     return {
+        "id": att_id,
         "port": port,
         "live": live_port is not None,
         "local_busid": local_busid,
@@ -526,7 +594,7 @@ async def api_attachment_details(port: str, user=Depends(require_session_user)):
         "serial": att.get("serial") or "",
         "label": att.get("label") or "",
         "group_id": att.get("group_id"),
-        "stable_path": usbip_client.group_symlink_path(att["group_id"]) if att.get("group_id") else None,
+        "stable_path": usbip_client.attachment_symlink_path(att.get("group_id") or att_id),
         "attached_at": att.get("attached_at"),
         "auto_failover": att.get("auto_failover", True),
         "restart_actions": att.get("restart_actions", []),
@@ -534,13 +602,13 @@ async def api_attachment_details(port: str, user=Depends(require_session_user)):
     }
 
 
-@app.put("/api/attachments/{port}")
+@app.put("/api/attachments/{att_id}")
 async def api_update_attachment(
-    port: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)
+    att_id: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)
 ):
     require_safe_ajax(request)
     cfg = config.store.read()
-    att = cfg["attachments"].get(port)
+    att = cfg["attachments"].get(att_id)
     if not att:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such attachment")
     updates = {
@@ -550,23 +618,24 @@ async def api_update_attachment(
             body.get("restart_actions", att.get("restart_actions"))
         ),
     }
-    config.store.update(lambda d, p=port, u=updates: d["attachments"][p].update(u))
+    config.store.update(lambda d, i=att_id, u=updates: d["attachments"][i].update(u))
     return {"ok": True}
 
 
-@app.post("/api/attachments/{port}/detach")
-async def api_detach(port: str, request: Request, user=Depends(require_session_user)):
+@app.post("/api/attachments/{att_id}/detach")
+async def api_detach(att_id: str, request: Request, user=Depends(require_session_user)):
     require_safe_ajax(request)
     cfg = config.store.read()
-    att = cfg["attachments"].get(port)
+    att = cfg["attachments"].get(att_id)
     if not att:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such attachment")
     try:
-        usbip_client.detach(port)
+        usbip_client.detach(att["port"])
     except usbip_client.UsbipCommandError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
-    config.store.update(lambda d, p=port: d["attachments"].pop(p, None))
-    groups.log_event(f"detached port {port}")
+    config.store.update(lambda d, i=att_id: d["attachments"].pop(i, None))
+    usbip_client.remove_attachment_symlink(att.get("group_id") or att_id)
+    groups.log_event(f"detached port {att['port']}")
     return {"ok": True}
 
 
@@ -575,7 +644,7 @@ async def api_detach(port: str, request: Request, user=Depends(require_session_u
 @app.get("/api/groups")
 async def api_list_groups(user=Depends(require_session_user)):
     cfg = config.store.read()
-    active = {att["group_id"]: port for port, att in cfg["attachments"].items() if att.get("group_id")}
+    active = {att["group_id"]: att.get("port") for att in cfg["attachments"].values() if att.get("group_id")}
     out = []
     for g in cfg["groups"].values():
         out.append({**g, "active_port": active.get(g["id"])})
@@ -696,16 +765,17 @@ async def api_proxmox_vms(user=Depends(require_session_user)):
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
 
 
-@app.post("/api/attachments/{port}/proxmox-attach")
+@app.post("/api/attachments/{att_id}/proxmox-attach")
 async def api_proxmox_attach(
-    port: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)
+    att_id: str, request: Request, user=Depends(require_session_user), body: dict = Body(...)
 ):
     require_safe_ajax(request)
     vmid = str(body.get("vmid", ""))
     cfg = config.store.read()
-    if port not in cfg["attachments"]:
+    att = cfg["attachments"].get(att_id)
+    if not att:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such attachment")
-    local_port = next((p for p in usbip_client.list_ports() if p.port == port), None)
+    local_port = next((p for p in usbip_client.list_ports() if p.port == att.get("port")), None)
     if not local_port or not local_port.local_busid:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "could not resolve local bus id for this port")
     try:
@@ -713,24 +783,24 @@ async def api_proxmox_attach(
     except proxmox.ProxmoxError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
     config.store.update(
-        lambda d, p=port, v=vmid, s=slot: d["attachments"][p].__setitem__("proxmox", {"vmid": v, "slot": s})
+        lambda d, i=att_id, v=vmid, s=slot: d["attachments"][i].__setitem__("proxmox", {"vmid": v, "slot": s})
     )
-    groups.log_event(f"port {port} passed through to VM {vmid} as {slot}")
+    groups.log_event(f"port {att.get('port')} passed through to VM {vmid} as {slot}")
     return {"vmid": vmid, "slot": slot}
 
 
-@app.post("/api/attachments/{port}/proxmox-detach")
-async def api_proxmox_detach(port: str, request: Request, user=Depends(require_session_user)):
+@app.post("/api/attachments/{att_id}/proxmox-detach")
+async def api_proxmox_detach(att_id: str, request: Request, user=Depends(require_session_user)):
     require_safe_ajax(request)
     cfg = config.store.read()
-    att = cfg["attachments"].get(port)
+    att = cfg["attachments"].get(att_id)
     if not att or not att.get("proxmox"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no proxmox passthrough recorded for this port")
     try:
         proxmox.detach_usb_from_vm(att["proxmox"]["vmid"], att["proxmox"]["slot"])
     except proxmox.ProxmoxError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
-    config.store.update(lambda d, p=port: d["attachments"][p].pop("proxmox", None))
+    config.store.update(lambda d, i=att_id: d["attachments"][i].pop("proxmox", None))
     return {"ok": True}
 
 
