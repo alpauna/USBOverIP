@@ -313,10 +313,15 @@ async def api_direct_attach(
         port = usbip_client.attach(server["host"], server["usbip_port"], busid)
     except usbip_client.UsbipCommandError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    # Default the client-side label to whatever the server has labeled this
+    # device as, so it doesn't show up blank just because the Browse
+    # Devices "Attach" button never prompts for one. An explicit label in
+    # the request body still wins.
+    default_label = str(body.get("label") or device.get("label") or "")[:80]
     record = {
         "server_id": server_id,
         "busid": busid,
-        "label": str(body.get("label", ""))[:80],
+        "label": default_label,
         "group_id": None,
         "attached_at": _now(),
         "auto_failover": bool(body.get("auto_failover", True)),

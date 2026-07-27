@@ -480,6 +480,7 @@ let EDITING_ATTACHMENT_PORT = null;
 function openAttachmentEditPanel(att) {
   EDITING_ATTACHMENT_PORT = att.port;
   document.getElementById("attachment-edit-title").textContent = `${att.server_name}/${att.busid} (port ${att.port})`;
+  document.getElementById("attachment-edit-label").value = att.label || "";
   document.getElementById("attachment-edit-auto-failover").checked = !!att.auto_failover;
   const rows = document.getElementById("attachment-edit-restart-rows");
   rows.innerHTML = "";
@@ -503,6 +504,7 @@ document.getElementById("attachment-edit-save-btn")?.addEventListener("click", a
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        label: document.getElementById("attachment-edit-label").value,
         auto_failover: document.getElementById("attachment-edit-auto-failover").checked,
         restart_actions: collectRestartActions(document.getElementById("attachment-edit-restart-rows")),
       }),
