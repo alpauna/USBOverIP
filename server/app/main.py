@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hmac
 import logging
@@ -48,11 +49,15 @@ supervisor = UsbipdSupervisor(port=config.USBIPD_PORT)
 async def on_startup():
     await supervisor.start()
     await _rebind_shared_devices()
+    app.state.watchdog_task = asyncio.create_task(_watchdog_loop())
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await supervisor.stop()
+    task = getattr(app.state, "watchdog_task", None)
+    if task:
+        task.cancel()
 
 
 async def _rebind_shared_devices() -> None:
@@ -81,6 +86,47 @@ async def _rebind_shared_devices() -> None:
             await notify_clients_device_available(busid)
         else:
             log_event(f"could not confirm {busid} is shared after startup")
+
+
+async def _watchdog_tick() -> None:
+    """Catches a device dropping out from under us while the server keeps
+    running - e.g. the physical device itself resets/reconnects (a real
+    USB disconnect, not just a daemon hiccup). _rebind_shared_devices only
+    runs once at startup, so without this, a device that resets mid-run
+    would stay unshared until an admin noticed and re-shared it by hand.
+    Unlike the startup pass, this only touches devices that are actually
+    currently unbound - already-fine devices are left alone so a healthy
+    system doesn't generate rebind calls or log noise every tick."""
+    cfg = config.store.read()
+    shared = list(cfg.get("shared_devices", []))
+    if not shared:
+        return
+    devices = {d.busid: d for d in list_local_devices()}
+    for busid in shared:
+        dev = devices.get(busid)
+        if dev and dev.status in ("shared_idle", "shared_in_use"):
+            continue  # already fine
+        try:
+            bind_device(busid)
+        except RuntimeError as e:
+            log_event(f"watchdog: bind for {busid} failed: {e}")
+            continue
+        refreshed = {d.busid: d for d in list_local_devices()}
+        dev = refreshed.get(busid)
+        if dev and dev.status in ("shared_idle", "shared_in_use"):
+            log_event(f"watchdog: rebound {busid} (was unbound while server was running)")
+            await notify_clients_device_available(busid)
+        else:
+            log_event(f"watchdog: could not confirm {busid} is shared after rebind attempt")
+
+
+async def _watchdog_loop(interval: int = 15) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _watchdog_tick()
+        except Exception:
+            logger.exception("watchdog tick failed")
 
 
 def _now() -> str:
