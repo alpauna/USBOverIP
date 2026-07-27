@@ -126,8 +126,12 @@ async def _ensure_shared_devices_bound(force: bool) -> None:
             if force:
                 log_event(f"rebound {busid} on startup")
         except RuntimeError as e:
+            # "Already bound to usbip-host" lands here too - that is NOT a
+            # reason to skip the status check/notify below. A container
+            # restart can lose client TCP sessions even when the
+            # kernel-level bind survives, so we still need to tell clients
+            # the device is available, exactly as if we'd bound it fresh.
             log_event(f"{'bind for ' + busid + ' on startup' if force else 'watchdog: bind for ' + busid} failed: {e}")
-            continue
         refreshed = {d.busid: d for d in list_local_devices()}
         dev = refreshed.get(busid)
         if dev and dev.status in ("shared_idle", "shared_in_use"):
