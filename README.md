@@ -294,6 +294,30 @@ the device. If your HA setup instead references a fixed device path, use
 the client's "Restart container" button (Local Docker containers panel)
 after attaching so HA re-scans `/dev`.
 
+If you'd rather point a specific HA integration at a fixed path directly
+(many serial-based integrations ask you to type or pick one in their own
+setup UI, rather than auto-discovering across all of `/dev/bus/usb`),
+mount the stable-symlink directory into HA too and reference the
+attachment id from its Details panel on the client dashboard - see
+"Stable device paths for downstream containers" below for what that id
+is and why it doesn't change across a reattach:
+
+```yaml
+services:
+  homeassistant:
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev/usbip-web:/dev/usbip-web   # so HA's own UI can reference a fixed /dev/usbip-web/<id> path
+    device_cgroup_rules:
+      - 'c 189:* rmw'
+```
+
+Then in that integration's own configuration, use
+`/dev/usbip-web/<attachment-id>` instead of picking whatever
+`/dev/ttyUSBx` happens to be current - it keeps working across a
+reattach or relocation with no restart needed at all, since HA opens
+that path itself rather than this app restarting the container for it.
+
 ## Stable device paths for downstream containers (recommended)
 
 **Why this exists:** a raw `/dev/ttyUSBx` or `/dev/bus/usb/BBB/DDD` path
