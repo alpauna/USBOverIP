@@ -48,7 +48,7 @@ supervisor = UsbipdSupervisor(port=config.USBIPD_PORT)
 @app.on_event("startup")
 async def on_startup():
     await supervisor.start()
-    await _rebind_shared_devices()
+    await _ensure_shared_devices_bound(force=True)
     app.state.watchdog_task = asyncio.create_task(_watchdog_loop())
 
 
@@ -60,77 +60,115 @@ async def on_shutdown():
         task.cancel()
 
 
-async def _rebind_shared_devices() -> None:
-    """Devices don't stay bound across a VM reboot - the kernel forgets.
-    But a plain container restart is different: the kernel-level bind can
-    survive even though the *daemon process* (and any client TCP sessions
-    to it) didn't. Either way, clients may need to reconnect, so we check
-    actual current status rather than trusting whether our bind attempt
-    itself reported success - "already bound" isn't a failure worth
-    skipping the notification for."""
+async def _ensure_shared_devices_bound(force: bool) -> None:
+    """Make sure every device the admin has shared is actually bound right
+    now, relocating it automatically if its busid changed.
+
+    `force=True` (startup): re-binds everything and notifies unconditionally
+    - a container/daemon restart can lose client TCP sessions even when the
+    kernel-level bind survives, so "already bound" isn't a reason to skip
+    the notification.
+
+    `force=False` (the recurring watchdog): only touches devices that
+    aren't currently fine, so a healthy system doesn't generate rebind
+    calls or log noise every tick.
+
+    Busid relocation: if a tracked busid is missing entirely, we look up
+    the serial we last saw there (known_serials) and search current
+    devices for a match. A whole-bus USB renumbering (seen in the wild
+    after a host-level USB reset) can shift every device to a different
+    busid with no warning even though nothing physically changed -
+    without this, that requires an admin to notice and remap everything
+    by hand. shared_devices/device_labels are corrected in place so the
+    fix sticks."""
     cfg = config.store.read()
     shared = list(cfg.get("shared_devices", []))
     if not shared:
         return
+
+    current = list_local_devices()
+    by_busid = {d.busid: d for d in current}
+    by_serial = {d.serial: d for d in current if d.serial}
+    known_serials = cfg.get("known_serials", {})
+
+    renames: dict[str, str] = {}
     for busid in shared:
+        if busid in by_busid:
+            continue
+        remembered = known_serials.get(busid)
+        moved = by_serial.get(remembered) if remembered else None
+        if moved and moved.busid not in shared:
+            log_event(f"{busid} not found; relocated to {moved.busid} (same serial {remembered})")
+            renames[busid] = moved.busid
+
+    if renames:
+        def _apply_renames(d):
+            labels = d.setdefault("device_labels", {})
+            slist = d.setdefault("shared_devices", [])
+            for old, new in renames.items():
+                if old in slist:
+                    slist.remove(old)
+                if new not in slist:
+                    slist.append(new)
+                if old in labels and new not in labels:
+                    labels[new] = labels.pop(old)
+
+        cfg = config.store.update(_apply_renames)
+        shared = list(cfg.get("shared_devices", []))
+        by_busid = {d.busid: d for d in list_local_devices()}
+
+    for busid in shared:
+        dev = by_busid.get(busid)
+        if not force and dev and dev.status in ("shared_idle", "shared_in_use"):
+            continue  # already fine, leave it alone (watchdog mode)
         try:
             bind_device(busid)
-            log_event(f"rebound {busid} on startup")
+            if force:
+                log_event(f"rebound {busid} on startup")
         except RuntimeError as e:
-            log_event(f"bind for {busid} on startup: {e}")
-
-    devices = {d.busid: d for d in list_local_devices()}
-    for busid in shared:
-        dev = devices.get(busid)
-        if dev and dev.status in ("shared_idle", "shared_in_use"):
-            await notify_clients_device_available(busid)
-        else:
-            log_event(f"could not confirm {busid} is shared after startup")
-
-
-async def _watchdog_tick() -> None:
-    """Catches a device dropping out from under us while the server keeps
-    running - e.g. the physical device itself resets/reconnects (a real
-    USB disconnect, not just a daemon hiccup). _rebind_shared_devices only
-    runs once at startup, so without this, a device that resets mid-run
-    would stay unshared until an admin noticed and re-shared it by hand.
-    Unlike the startup pass, this only touches devices that are actually
-    currently unbound - already-fine devices are left alone so a healthy
-    system doesn't generate rebind calls or log noise every tick."""
-    cfg = config.store.read()
-    shared = list(cfg.get("shared_devices", []))
-    if not shared:
-        return
-    devices = {d.busid: d for d in list_local_devices()}
-    for busid in shared:
-        dev = devices.get(busid)
-        if dev and dev.status in ("shared_idle", "shared_in_use"):
-            continue  # already fine
-        try:
-            bind_device(busid)
-        except RuntimeError as e:
-            log_event(f"watchdog: bind for {busid} failed: {e}")
+            log_event(f"{'bind for ' + busid + ' on startup' if force else 'watchdog: bind for ' + busid} failed: {e}")
             continue
         refreshed = {d.busid: d for d in list_local_devices()}
         dev = refreshed.get(busid)
         if dev and dev.status in ("shared_idle", "shared_in_use"):
-            log_event(f"watchdog: rebound {busid} (was unbound while server was running)")
-            await notify_clients_device_available(busid)
+            if not force:
+                log_event(f"watchdog: rebound {busid} (was unbound while server was running)")
+            await notify_clients_device_available(busid, serial=dev.serial)
         else:
-            log_event(f"watchdog: could not confirm {busid} is shared after rebind attempt")
+            log_event(f"could not confirm {busid} is shared after bind attempt")
+
+    # Refresh the serial snapshot for everything currently tracked, so a
+    # future relocation has an up-to-date "last seen serial" to search by.
+    final = {d.busid: d for d in list_local_devices()}
+    new_known = {b: s for b, s in known_serials.items() if b in shared}
+    dirty = new_known != known_serials
+    for busid in shared:
+        dev = final.get(busid)
+        if dev and dev.serial and new_known.get(busid) != dev.serial:
+            new_known[busid] = dev.serial
+            dirty = True
+    if dirty:
+        config.store.update(lambda d: d.update(known_serials=new_known))
 
 
 async def _watchdog_loop(interval: int = 15) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            await _watchdog_tick()
+            await _ensure_shared_devices_bound(force=False)
         except Exception:
             logger.exception("watchdog tick failed")
 
 
 def _now() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+def _get_device_serial(busid: str) -> str | None:
+    for d in list_local_devices():
+        if d.busid == busid:
+            return d.serial or None
+    return None
 
 
 def _public_client(c: dict) -> dict:
@@ -145,12 +183,16 @@ def _public_client(c: dict) -> dict:
     }
 
 
-async def notify_clients_device_available(busid: str) -> None:
+async def notify_clients_device_available(busid: str, serial: str = "") -> None:
     """Best-effort push telling every registered client that `busid` just
     became shared/available, so clients with a matching (now-dropped)
     attachment can reconnect immediately instead of waiting for their own
     watchdog poll. Never raises - a client being unreachable must not
-    block the share/rebind action that triggered this."""
+    block the share/rebind action that triggered this.
+
+    `serial` is included so a client whose own stored busid for this
+    device is stale (the same relocation problem this server just solved
+    for itself) can still recognize it by serial and self-correct."""
     cfg = config.store.read()
     for client in cfg.get("clients", {}).values():
         if not client.get("token"):
@@ -158,7 +200,11 @@ async def notify_clients_device_available(busid: str) -> None:
         url = f"http://{client['host']}:{client['api_port']}/api/remote/devices/{busid}/reconnect"
         try:
             async with httpx.AsyncClient(timeout=5) as http:
-                resp = await http.post(url, headers={"Authorization": f"Bearer {client['token']}"})
+                resp = await http.post(
+                    url,
+                    headers={"Authorization": f"Bearer {client['token']}"},
+                    json={"serial": serial},
+                )
             if resp.status_code != 200:
                 log_event(f"notify {client['name']} about {busid}: HTTP {resp.status_code}")
         except Exception as e:
@@ -301,13 +347,15 @@ async def api_share(busid: str, request: Request, user=Depends(require_session_u
     except RuntimeError as e:
         log_event(f"failed to share {busid}: {e}")
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    serial = _get_device_serial(busid)
     config.store.update(
-        lambda d: d.update(
-            shared_devices=sorted(set(d.get("shared_devices", [])) | {busid})
+        lambda d: (
+            d.update(shared_devices=sorted(set(d.get("shared_devices", [])) | {busid})),
+            d.setdefault("known_serials", {}).update({busid: serial} if serial else {}),
         )
     )
     log_event(f"shared {busid}")
-    await notify_clients_device_available(busid)
+    await notify_clients_device_available(busid, serial=serial or "")
     return {"ok": True}
 
 
@@ -347,13 +395,15 @@ async def api_request_share(busid: str, caller: str = Depends(require_bearer_or_
     except RuntimeError as e:
         log_event(f"{caller} failed to share {busid}: {e}")
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    serial = _get_device_serial(busid)
     config.store.update(
-        lambda d: d.update(
-            shared_devices=sorted(set(d.get("shared_devices", [])) | {busid})
+        lambda d: (
+            d.update(shared_devices=sorted(set(d.get("shared_devices", [])) | {busid})),
+            d.setdefault("known_serials", {}).update({busid: serial} if serial else {}),
         )
     )
     log_event(f"{caller} requested share of {busid}")
-    await notify_clients_device_available(busid)
+    await notify_clients_device_available(busid, serial=serial or "")
     return {"ok": True}
 
 

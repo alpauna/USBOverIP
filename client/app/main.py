@@ -321,6 +321,7 @@ async def api_direct_attach(
     record = {
         "server_id": server_id,
         "busid": busid,
+        "serial": device.get("serial", ""),
         "label": default_label,
         "group_id": None,
         "attached_at": _now(),
@@ -352,6 +353,7 @@ async def api_attachments(user=Depends(require_session_user)):
                 "server_id": att["server_id"],
                 "server_name": server["name"] if server else "(deleted server)",
                 "busid": att["busid"],
+                "serial": att.get("serial") or "",
                 "local_busid": live_ports[port].local_busid if port in live_ports else None,
                 "label": att.get("label") or "",
                 "group_id": att.get("group_id"),
@@ -387,6 +389,7 @@ async def api_attachment_details(port: str, user=Depends(require_session_user)):
         "server_id": att["server_id"],
         "server_name": server["name"] if server else "(deleted server)",
         "busid": att["busid"],
+        "serial": att.get("serial") or "",
         "label": att.get("label") or "",
         "group_id": att.get("group_id"),
         "attached_at": att.get("attached_at"),
@@ -626,9 +629,12 @@ async def api_docker_restart(name: str, request: Request, user=Depends(require_s
 # our own watchdog poll.
 
 @app.post("/api/remote/devices/{busid}/reconnect")
-async def api_remote_reconnect(busid: str, server_id: str = Depends(require_server_token)):
+async def api_remote_reconnect(
+    busid: str, server_id: str = Depends(require_server_token), body: dict = Body(default={})
+):
     validate_busid(busid)
-    result = await groups.reconnect_device(server_id, busid)
+    serial = str(body.get("serial", "") or "")
+    result = await groups.reconnect_device(server_id, busid, serial=serial)
     if result is None:
         return {"status": "no_attachment_on_record"}
     return result

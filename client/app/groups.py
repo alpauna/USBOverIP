@@ -62,17 +62,17 @@ def run_restart_actions(actions: list[dict] | None) -> None:
             log_event(f"failed to restart {kind} '{name}': {e}")
 
 
-async def _candidate_status(server: dict, busid: str) -> tuple[bool, str]:
+async def _candidate_status(server: dict, busid: str) -> tuple[bool, str, str]:
     try:
         devices = await remote_client.fetch_devices(server["host"], server["api_port"], server["token"])
     except remote_client.RemoteError as e:
-        return False, f"unreachable ({e})"
+        return False, f"unreachable ({e})", ""
     for d in devices:
         if d["busid"] == busid:
             if d["status"] == "shared_idle":
-                return True, "available"
-            return False, f"status is {d['status']}"
-    return False, "device not currently shared on that server"
+                return True, "available", d.get("serial", "")
+            return False, f"status is {d['status']}", d.get("serial", "")
+    return False, "device not currently shared on that server", ""
 
 
 def _active_port_for_group(cfg: dict, group_id: str) -> str | None:
@@ -96,7 +96,7 @@ async def attach_group(group_id: str) -> dict:
         if not server:
             errors.append(f"{candidate['server_id']}: server not registered")
             continue
-        ok, reason = await _candidate_status(server, candidate["busid"])
+        ok, reason, serial = await _candidate_status(server, candidate["busid"])
         if not ok:
             errors.append(f"{server['name']}/{candidate['busid']}: {reason}")
             continue
@@ -109,6 +109,7 @@ async def attach_group(group_id: str) -> dict:
         record = {
             "server_id": server["id"],
             "busid": candidate["busid"],
+            "serial": serial,
             "label": candidate.get("label") or group["name"],
             "group_id": group_id,
             "attached_at": now,
@@ -169,36 +170,88 @@ async def _restore_dropped_attachment(port: str, att: dict) -> dict:
     if not server:
         log_event(f"auto-reconnect failed: server {att.get('server_id')} is no longer registered")
         return {"status": "failed", "error": "server not registered"}
+
+    target_busid = att["busid"]
     try:
-        new_port = usbip_client.attach(server["host"], server["usbip_port"], att["busid"])
+        new_port = usbip_client.attach(server["host"], server["usbip_port"], target_busid)
     except usbip_client.UsbipCommandError as e:
-        log_event(f"auto-reconnect failed for {server['name']}/{att['busid']}: {e}")
-        return {"status": "failed", "error": str(e)}
+        # The device may have relocated to a different busid on the server
+        # (a whole-bus USB renumbering shifts everything, with no warning,
+        # even though nothing physically changed). If we know its serial,
+        # ask the server for its current device list and retry once
+        # wherever that same serial actually is now.
+        relocated_busid = await _find_relocated_busid(server, att.get("serial"), target_busid)
+        if not relocated_busid:
+            log_event(f"auto-reconnect failed for {server['name']}/{target_busid}: {e}")
+            return {"status": "failed", "error": str(e)}
+        log_event(
+            f"{server['name']}/{target_busid} not found; relocated to {relocated_busid} "
+            f"(same serial {att.get('serial')}) - retrying"
+        )
+        try:
+            new_port = usbip_client.attach(server["host"], server["usbip_port"], relocated_busid)
+        except usbip_client.UsbipCommandError as e2:
+            log_event(f"auto-reconnect failed for {server['name']}/{relocated_busid}: {e2}")
+            return {"status": "failed", "error": str(e2)}
+        target_busid = relocated_busid
+
     now = datetime.datetime.utcnow().isoformat() + "Z"
-    new_record = {**att, "attached_at": now}
+    new_record = {**att, "busid": target_busid, "attached_at": now}
 
     def _replace(d, old_port=port, new_port=new_port, record=new_record):
         d["attachments"].pop(old_port, None)
         d["attachments"][new_port] = record
 
     config.store.update(_replace)
-    log_event(f"auto-reconnect: reattached {server['name']}/{att['busid']} on port {new_port}")
+    log_event(f"auto-reconnect: reattached {server['name']}/{target_busid} on port {new_port}")
     run_restart_actions(att.get("restart_actions", []))
-    return {"status": "reattached", "port": new_port, "server": server["name"], "busid": att["busid"]}
+    return {"status": "reattached", "port": new_port, "server": server["name"], "busid": target_busid}
 
 
-async def reconnect_device(server_id: str, busid: str) -> dict | None:
+async def _find_relocated_busid(server: dict, serial: str | None, old_busid: str) -> str | None:
+    if not serial:
+        return None
+    try:
+        devices = await remote_client.fetch_devices(server["host"], server["api_port"], server["token"])
+    except remote_client.RemoteError:
+        return None
+    match = next(
+        (d for d in devices if d.get("serial") == serial and d["busid"] != old_busid),
+        None,
+    )
+    if match and match["status"] == "shared_idle":
+        return match["busid"]
+    return None
+
+
+async def reconnect_device(server_id: str, busid: str, serial: str = "") -> dict | None:
     """Called from the /api/remote/devices/{busid}/reconnect push receiver.
     Returns None if we have no record of ever attaching this device (the
-    push is a no-op for us), otherwise a status dict."""
+    push is a no-op for us), otherwise a status dict.
+
+    `serial` (passed by the server alongside the push) lets us recognize
+    a device we have an attachment for even when *our* stored busid for
+    it is stale - the same relocation the server already corrected for
+    itself. Only used as a fallback when there's no direct busid match."""
     cfg = config.store.read()
     live_ports = {p.port for p in usbip_client.list_ports()}
+
     for port, att in cfg["attachments"].items():
         if att.get("server_id") != server_id or att.get("busid") != busid:
             continue
         if port in live_ports:
             return {"status": "already_live", "port": port}
         return await _restore_dropped_attachment(port, att)
+
+    if serial:
+        for port, att in cfg["attachments"].items():
+            if att.get("server_id") != server_id or att.get("serial") != serial:
+                continue
+            if port in live_ports:
+                continue  # something else is already live on this port
+            config.store.update(lambda d, p=port, b=busid: d["attachments"][p].__setitem__("busid", b))
+            return await _restore_dropped_attachment(port, {**att, "busid": busid})
+
     return None
 
 
