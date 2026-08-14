@@ -121,6 +121,59 @@ really has a duplicate serial or just isn't exposing one, and consider
 it a candidate for replacement if it's going into a failover-critical
 role.
 
+## Reconnect backoff and stale (zombie) exports
+
+Every attachment's watchdog reconnect attempts are tracked with a
+`failure_count`. After 3 consecutive failures the watchdog backs off
+exponentially (60s, 120s, 240s, ... capped at 30 minutes) instead of
+retrying every 15s tick forever - visible per-attachment on the client
+dashboard, and logged to Recent Activity. A server-pushed "this device is
+available again" notification always bypasses the backoff and retries
+immediately, since it only fires when the server itself just changed
+something concrete (rebound the device, an admin re-shared it).
+
+**The recurring root cause behind a stuck backoff:** the client's local
+session dies (container restart, network blip, a half-completed attach)
+but the *server's* `usbip-host` kernel driver never released the export -
+confirmed by `/sys/bus/usb/drivers/usbip-host/<busid>/usbip_status`
+reading `2` (in use) with no client actually holding it. Every reattempt
+then bounces off `Device busy (exported)` forever, because the client
+detaching its own (already-dead) session can't fix a stale export on the
+*server's* end - only the server unbinding and rebinding the device at
+the kernel level clears it.
+
+**Fixing it by hand:** on the server dashboard, each device row has an
+**Unbind** button (next to Share/Unshare) that force-unbinds and rebinds
+the device regardless of its currently-reported status - unlike Unshare,
+which is disabled while the driver reports the device in use, this
+reaches the stuck case specifically. It then re-notifies registered
+clients so they retry immediately instead of waiting out the backoff.
+Same operation from the CLI: `usbip unbind -b <busid> && usbip bind -b
+<busid>` on the server.
+
+**Fixing it automatically:** each attachment's edit panel on the client
+dashboard has a checkbox, *"Force a server-side unbind/rebind after
+repeated reconnect failures"* (`auto_rebind_on_backoff`). When enabled,
+after 6 consecutive reconnect failures the client calls the server's
+unbind/rebind endpoint on itself (using its own registered bearer token)
+instead of waiting for an admin. Off by default - enable it per
+attachment for devices where you've actually seen this failure mode.
+
+**A second failure mode this uncovered:** vhci local port numbers are a
+small, reused space - freed and reassigned as attachments come and go.
+The watchdog and the server-push reconnect handler used to treat "some
+attachment is live on port N" as proof that *this* attachment's own
+stored port N was still it. In practice, when one attachment silently
+dropped and a *different* attachment was later assigned that same port
+number, the watchdog saw the number occupied and stopped trying to
+reconnect the dead one - permanently, since nothing else would ever
+prompt another attempt. Every attachment record now also stores the
+local busid (e.g. `2-3`) the kernel assigned it at attach time, and
+liveness checks require that to still match what's actually on that port
+now, not just the bare port number. Attachments from before this change
+fall back to the old port-only check until their next successful
+reconnect fills in the new field.
+
 ## Security model (read this)
 
 - Each web UI (server, client) has its own bcrypt-hashed admin password,

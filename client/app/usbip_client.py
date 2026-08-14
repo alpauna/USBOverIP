@@ -58,7 +58,15 @@ class AttachedPort:
     local_busid: str | None
 
 
-def attach(host: str, usbip_port: int, busid: str) -> str:
+def attach(host: str, usbip_port: int, busid: str) -> AttachedPort:
+    """Returns the newly-attached AttachedPort (port number *and* the local
+    busid the kernel assigned it) - callers should persist both, not just
+    the port number. Port numbers are a small, reused space (see the module
+    docstring's cross-vhci_hcd-instance caveat, and simply because ports get
+    freed and reused as attachments come and go) - the local_busid is what
+    actually lets a caller later tell "is the device I attached still the
+    one sitting on this port" apart from "some other device now reuses the
+    same port number", which a bare port-number comparison can't do."""
     validate_hostname(host)
     usbip_port = validate_port_number(usbip_port)
     validate_busid(busid)
@@ -81,7 +89,7 @@ def attach(host: str, usbip_port: int, busid: str) -> str:
             break
         time.sleep(0.3)
     if len(new_ports) == 1:
-        return new_ports[0].port
+        return new_ports[0]
     if len(new_ports) > 1:
         # Concurrent attach elsewhere raced us; pick the lowest new port and
         # log it so it's visible if this ever actually happens.
@@ -90,7 +98,7 @@ def attach(host: str, usbip_port: int, busid: str) -> str:
             "multiple new vhci ports appeared after attach (%s); using the lowest",
             [p.port for p in new_ports],
         )
-        return new_ports[0].port
+        return new_ports[0]
     raise UsbipCommandError(
         f"usbip attach reported success but no new local port appeared: {output.strip()}"
     )
@@ -141,6 +149,13 @@ def list_ports() -> list[AttachedPort]:
     if ports is not None:
         return ports
     return _list_ports_via_cli()
+
+
+def live_port_map() -> dict[str, str | None]:
+    """{port: local_busid} for every currently-attached port - the shape
+    callers need to check "is *my* attachment still the thing on this port"
+    rather than just "is this port number attached to something"."""
+    return {p.port: p.local_busid for p in list_ports()}
 
 
 def is_port_active(local_port: str) -> bool:

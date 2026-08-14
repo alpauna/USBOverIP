@@ -497,7 +497,7 @@ async def api_direct_attach(
         groups.log_event(f"requested share of {server['name']}/{busid}")
 
     try:
-        port = usbip_client.attach(server["host"], server["usbip_port"], busid)
+        attached = usbip_client.attach(server["host"], server["usbip_port"], busid)
     except usbip_client.UsbipCommandError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
     # Default the client-side label to whatever the server has labeled this
@@ -515,18 +515,20 @@ async def api_direct_attach(
         "group_id": None,
         "attached_at": _now(),
         "auto_failover": bool(body.get("auto_failover", True)),
+        "auto_rebind_on_backoff": bool(body.get("auto_rebind_on_backoff", False)),
         "restart_actions": _clean_restart_actions(body.get("restart_actions")),
-        "port": port,
+        "port": attached.port,
+        "local_busid": attached.local_busid,
     }
     config.store.update(lambda d, i=att_id, r=record: d["attachments"].__setitem__(i, r))
-    groups.log_event(f"direct attach: {server['name']}/{busid} -> port {port}")
+    groups.log_event(f"direct attach: {server['name']}/{busid} -> port {attached.port}")
 
-    stable_path = groups.update_symlink_for_port(att_id, port)
+    stable_path = groups.update_symlink_for_port(att_id, attached.port)
     if stable_path:
         groups.log_event(f"{server['name']}/{busid} stable device path: {stable_path}")
 
     groups.run_restart_actions(record["restart_actions"])
-    return {"port": port, "id": att_id}
+    return {"port": attached.port, "id": att_id}
 
 
 def _now() -> str:
@@ -557,6 +559,7 @@ async def api_attachments(user=Depends(require_session_user)):
                 "stable_path": usbip_client.attachment_symlink_path(att.get("group_id") or att_id),
                 "attached_at": att.get("attached_at"),
                 "auto_failover": att.get("auto_failover", False),
+                "auto_rebind_on_backoff": att.get("auto_rebind_on_backoff", False),
                 "restart_actions": att.get("restart_actions", []),
                 "proxmox": att.get("proxmox"),
                 "live": port in live_ports,
@@ -597,6 +600,7 @@ async def api_attachment_details(att_id: str, user=Depends(require_session_user)
         "stable_path": usbip_client.attachment_symlink_path(att.get("group_id") or att_id),
         "attached_at": att.get("attached_at"),
         "auto_failover": att.get("auto_failover", True),
+        "auto_rebind_on_backoff": att.get("auto_rebind_on_backoff", False),
         "restart_actions": att.get("restart_actions", []),
         "proxmox": att.get("proxmox"),
     }
@@ -614,6 +618,9 @@ async def api_update_attachment(
     updates = {
         "label": str(body.get("label", att.get("label", "")))[:80],
         "auto_failover": bool(body.get("auto_failover", att.get("auto_failover", True))),
+        "auto_rebind_on_backoff": bool(
+            body.get("auto_rebind_on_backoff", att.get("auto_rebind_on_backoff", False))
+        ),
         "restart_actions": _clean_restart_actions(
             body.get("restart_actions", att.get("restart_actions"))
         ),

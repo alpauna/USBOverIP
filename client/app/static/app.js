@@ -567,6 +567,7 @@ function openAttachmentEditPanel(att) {
   document.getElementById("attachment-edit-title").textContent = `${att.server_name}/${att.busid} (port ${att.port})`;
   document.getElementById("attachment-edit-label").value = att.label || "";
   document.getElementById("attachment-edit-auto-failover").checked = !!att.auto_failover;
+  document.getElementById("attachment-edit-auto-rebind").checked = !!att.auto_rebind_on_backoff;
   const rows = document.getElementById("attachment-edit-restart-rows");
   rows.innerHTML = "";
   for (const action of att.restart_actions || []) addRestartActionRow(rows, action);
@@ -591,6 +592,7 @@ document.getElementById("attachment-edit-save-btn")?.addEventListener("click", a
       body: JSON.stringify({
         label: document.getElementById("attachment-edit-label").value,
         auto_failover: document.getElementById("attachment-edit-auto-failover").checked,
+        auto_rebind_on_backoff: document.getElementById("attachment-edit-auto-rebind").checked,
         restart_actions: collectRestartActions(document.getElementById("attachment-edit-restart-rows")),
       }),
     });

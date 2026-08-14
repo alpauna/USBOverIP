@@ -52,6 +52,28 @@ async def request_share(host: str, api_port: int, token: str, busid: str) -> Non
         raise RemoteError(f"server returned HTTP {resp.status_code}" + (f": {detail}" if detail else ""))
 
 
+async def request_rebind(host: str, api_port: int, token: str, busid: str) -> None:
+    """Ask the server to force-unbind/rebind a device we can't reattach to,
+    clearing a stale export that survived on the server's end after our own
+    session died - see groups.py's auto-rebind-on-backoff logic."""
+    validate_busid(busid)
+    url = f"{_base_url(host, api_port)}/api/devices/{busid}/rebind"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, headers={"Authorization": f"Bearer {token}"})
+    except httpx.RequestError as e:
+        raise RemoteError(f"could not reach server: {e}") from e
+    if resp.status_code == 401:
+        raise RemoteError("server rejected token (unauthorized)")
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("detail", "")
+        except Exception:
+            pass
+        raise RemoteError(f"server returned HTTP {resp.status_code}" + (f": {detail}" if detail else ""))
+
+
 async def register_wireguard(host: str, api_port: int, token: str, pubkey: str) -> dict:
     """Joins that server's WireGuard tunnel using our own public key - see
     common/wireguard_helper.py's module docstring for the overall design.

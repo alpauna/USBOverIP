@@ -451,6 +451,42 @@ async def api_unshare(busid: str, request: Request, user=Depends(require_session
     return {"ok": True}
 
 
+@app.post("/api/devices/{busid}/rebind")
+async def api_rebind(busid: str, caller: str = Depends(require_bearer_or_session)):
+    """Force-clear a stale/zombie export by unbinding and rebinding the
+    device at the kernel level, then re-notifying clients. This is the
+    manual escape hatch for the case documented in groups.py's
+    reconnect_device(): a client's session died but the usbip-host driver
+    here never released the export, so every client reattach attempt
+    bounces off "Device busy (exported)" forever. /unshare can't reach
+    this - it's disabled in the UI while the driver still reports the
+    device in use - so this endpoint runs unbind/bind unconditionally
+    regardless of the device's current reported status.
+
+    Callable either from this dashboard (session auth, browser click) or
+    by a registered client's own backend (bearer token) - a client with
+    auto_rebind_on_backoff enabled calls this on itself after repeated
+    reconnect failures instead of waiting on an admin. No AJAX-header
+    check, matching /request-share: that check is CSRF protection for
+    browser-session calls, and a bearer-token caller can't set it, so
+    other bearer-eligible endpoints skip it the same way."""
+    try:
+        validate_busid(busid)
+        unbind_device(busid)
+        bind_device(busid)
+    except ValidationError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    except RuntimeError as e:
+        log_event(f"failed to rebind {busid}: {e}")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    log_event(f"force-rebound {busid} to clear a stale export")
+    cfg = config.store.read()
+    if busid in cfg.get("shared_devices", []):
+        serial = _get_device_serial(busid)
+        await notify_clients_device_available(busid, serial=serial or "")
+    return {"ok": True}
+
+
 @app.post("/api/devices/{busid}/request-share")
 async def api_request_share(busid: str, caller: str = Depends(require_bearer_or_session)):
     """Lets a registered client ask the server to share a device it can see

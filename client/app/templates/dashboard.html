@@ -92,6 +92,8 @@
     <strong id="attachment-edit-title"></strong>
     <label>Label<input id="attachment-edit-label" placeholder="optional label"></label>
     <label><input type="checkbox" id="attachment-edit-auto-failover" style="width:auto"> Auto-reconnect if this attachment drops</label>
+    <label><input type="checkbox" id="attachment-edit-auto-rebind" style="width:auto"> Force a server-side unbind/rebind after repeated reconnect failures</label>
+    <p class="muted tiny">If reconnects keep failing (the server still thinks this device is in use even though nothing is attached), automatically ask the server to unbind and rebind it instead of waiting for the backoff timer or an admin to fix it by hand.</p>
     <div id="attachment-edit-restart-rows" class="stack"></div>
     <button type="button" id="attachment-edit-add-restart-row-btn" class="secondary">+ Add restart action</button>
     <div class="row" style="margin-top:10px">

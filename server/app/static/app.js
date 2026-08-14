@@ -97,6 +97,21 @@ async function loadDevices() {
           actionBtn.disabled = false;
         }
       });
+      const rebindBtn = el("button", { class: "secondary", text: "Unbind" });
+      rebindBtn.title = "Force-clear a stuck export: unbind then rebind this device. Use when a client can't " +
+        "reattach and reports \"Device busy\" even though nothing is really using it.";
+      rebindBtn.addEventListener("click", async () => {
+        if (!confirm(`Unbind and rebind ${dev.busid}? Any client currently attached will be dropped and should auto-reconnect.`)) return;
+        rebindBtn.disabled = true;
+        try {
+          await ajax(`/api/devices/${dev.busid}/rebind`, { method: "POST" });
+          await loadDevices();
+        } catch (e) {
+          alert(e.message);
+        } finally {
+          rebindBtn.disabled = false;
+        }
+      });
       const row = el("tr", {}, [
         el("td", { text: dev.busid }),
         el("td", { text: dev.description }),
@@ -104,7 +119,7 @@ async function loadDevices() {
         el("td", {}, [serialCell]),
         el("td", {}, [labelInput]),
         el("td", {}, [badge]),
-        el("td", {}, [actionBtn]),
+        el("td", { class: "row" }, [actionBtn, rebindBtn]),
       ]);
       tbody.appendChild(row);
     }

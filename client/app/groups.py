@@ -46,6 +46,15 @@ BACKOFF_THRESHOLD = 3
 BACKOFF_BASE_SECONDS = 60
 BACKOFF_MAX_SECONDS = 1800
 
+# If an attachment has auto_rebind_on_backoff set, a run of this many
+# consecutive reconnect failures (two backoff cycles in) is treated as
+# evidence of a stale/zombie export on the server rather than a transient
+# blip, and triggers one force unbind/rebind request to the server (see
+# main.py's /api/devices/{busid}/rebind) instead of waiting on an admin.
+# Fires once per drop-out - _note_reconnect_failure resets the counter on
+# the next successful reconnect, which re-arms it for next time.
+FORCE_REBIND_AFTER_FAILURES = 6
+
 
 class GroupError(Exception):
     pass
@@ -56,13 +65,17 @@ def log_event(message: str) -> None:
     logger.info(message)
 
 
-def _note_reconnect_failure(att_id: str) -> None:
+def _note_reconnect_failure(att_id: str) -> int:
+    result_count = 0
+
     def _bump(d, i=att_id):
+        nonlocal result_count
         att = d["attachments"].get(i)
         if not att:
             return
         count = att.get("failure_count", 0) + 1
         att["failure_count"] = count
+        result_count = count
         if count >= BACKOFF_THRESHOLD:
             delay = min(BACKOFF_BASE_SECONDS * (2 ** (count - BACKOFF_THRESHOLD)), BACKOFF_MAX_SECONDS)
             next_retry = datetime.datetime.utcnow() + datetime.timedelta(seconds=delay)
@@ -73,6 +86,21 @@ def _note_reconnect_failure(att_id: str) -> None:
             )
 
     config.store.update(_bump)
+    return result_count
+
+
+async def _maybe_force_rebind(att: dict, server: dict, busid: str, failure_count: int) -> None:
+    if not att.get("auto_rebind_on_backoff") or failure_count != FORCE_REBIND_AFTER_FAILURES:
+        return
+    label = att.get("label") or busid
+    try:
+        await remote_client.request_rebind(server["host"], server["api_port"], server["token"], busid)
+        log_event(
+            f"{label}: {failure_count} consecutive failures, requested a force unbind/rebind "
+            f"on {server['name']} to clear a possible stale export"
+        )
+    except remote_client.RemoteError as e:
+        log_event(f"{label}: force rebind request to {server['name']} failed: {e}")
 
 
 def _note_reconnect_success(att_id: str) -> None:
@@ -167,7 +195,7 @@ async def attach_group(group_id: str) -> dict:
             errors.append(f"{server['name']}/{candidate['busid']}: {reason}")
             continue
         try:
-            port = usbip_client.attach(server["host"], server["usbip_port"], candidate["busid"])
+            attached = usbip_client.attach(server["host"], server["usbip_port"], candidate["busid"])
         except usbip_client.UsbipCommandError as e:
             errors.append(f"{server['name']}/{candidate['busid']}: {e}")
             continue
@@ -183,17 +211,18 @@ async def attach_group(group_id: str) -> dict:
             "attached_at": now,
             "auto_failover": bool(group.get("auto_failover", True)),
             "restart_actions": [],  # group-level actions are run below, not stored per-attachment
-            "port": port,
+            "port": attached.port,
+            "local_busid": attached.local_busid,
         }
         config.store.update(lambda d, i=att_id, r=record: d["attachments"].__setitem__(i, r))
-        log_event(f"group '{group['name']}' attached via {server['name']}/{candidate['busid']} (port {port})")
+        log_event(f"group '{group['name']}' attached via {server['name']}/{candidate['busid']} (port {attached.port})")
 
-        stable_path = update_symlink_for_port(group_id, port)
+        stable_path = update_symlink_for_port(group_id, attached.port)
         if stable_path:
             log_event(f"group '{group['name']}' stable device path: {stable_path}")
 
         run_restart_actions(group.get("restart_actions", []))
-        return {"port": port, "server_id": server["id"], "server": server["name"], "busid": candidate["busid"]}
+        return {"port": attached.port, "server_id": server["id"], "server": server["name"], "busid": candidate["busid"]}
 
     log_event(f"group '{group['name']}' attach failed: no candidate available")
     raise GroupError("no candidate available: " + "; ".join(errors))
@@ -262,7 +291,7 @@ async def _restore_dropped_attachment(att_id: str, att: dict) -> dict:
 
     target_busid = att["busid"]
     try:
-        new_port = usbip_client.attach(server["host"], server["usbip_port"], target_busid)
+        attached = usbip_client.attach(server["host"], server["usbip_port"], target_busid)
     except usbip_client.UsbipCommandError as e:
         # The device may have relocated to a different busid on the server
         # (a whole-bus USB renumbering shifts everything, with no warning,
@@ -272,32 +301,40 @@ async def _restore_dropped_attachment(att_id: str, att: dict) -> dict:
         relocated_busid = await _find_relocated_busid(server, att.get("serial"), target_busid)
         if not relocated_busid:
             log_event(f"auto-reconnect failed for {server['name']}/{target_busid}: {e}")
-            _note_reconnect_failure(att_id)
+            count = _note_reconnect_failure(att_id)
+            await _maybe_force_rebind(att, server, target_busid, count)
             return {"status": "failed", "error": str(e)}
         log_event(
             f"{server['name']}/{target_busid} not found; relocated to {relocated_busid} "
             f"(same serial {att.get('serial')}) - retrying"
         )
         try:
-            new_port = usbip_client.attach(server["host"], server["usbip_port"], relocated_busid)
+            attached = usbip_client.attach(server["host"], server["usbip_port"], relocated_busid)
         except usbip_client.UsbipCommandError as e2:
             log_event(f"auto-reconnect failed for {server['name']}/{relocated_busid}: {e2}")
-            _note_reconnect_failure(att_id)
+            count = _note_reconnect_failure(att_id)
+            await _maybe_force_rebind(att, server, relocated_busid, count)
             return {"status": "failed", "error": str(e2)}
         target_busid = relocated_busid
 
     now = datetime.datetime.utcnow().isoformat() + "Z"
-    new_record = {**att, "busid": target_busid, "attached_at": now, "port": new_port}
+    new_record = {
+        **att,
+        "busid": target_busid,
+        "attached_at": now,
+        "port": attached.port,
+        "local_busid": attached.local_busid,
+    }
     config.store.update(lambda d, i=att_id, r=new_record: d["attachments"].__setitem__(i, r))
     _note_reconnect_success(att_id)
-    log_event(f"auto-reconnect: reattached {server['name']}/{target_busid} on port {new_port}")
+    log_event(f"auto-reconnect: reattached {server['name']}/{target_busid} on port {attached.port}")
 
-    stable_path = update_symlink_for_port(att_id, new_port)
+    stable_path = update_symlink_for_port(att_id, attached.port)
     if stable_path:
         log_event(f"{server['name']}/{target_busid} stable device path: {stable_path}")
 
     run_restart_actions(att.get("restart_actions", []))
-    return {"status": "reattached", "port": new_port, "server": server["name"], "busid": target_busid}
+    return {"status": "reattached", "port": attached.port, "server": server["name"], "busid": target_busid}
 
 
 async def _find_relocated_busid(server: dict, serial: str | None, old_busid: str) -> str | None:
@@ -340,27 +377,46 @@ async def reconnect_device(server_id: str, busid: str, serial: str = "") -> dict
     dropping packets instead of resetting the connection), the reattach
     below will fail with "device busy" and this still needs a manual
     `usbip unbind`/`usbip bind` on the server to clear - detaching our
-    own zombie can't fix a zombie on the other end."""
+    own zombie can't fix a zombie on the other end.
+
+    Port numbers get reused as attachments come and go, so "this
+    attachment's stored port is currently occupied" isn't proof it's
+    occupied by *this* attachment - it may just as well be a different,
+    genuinely-live attachment that was assigned the same number later. We
+    only force-detach when the local_busid actually attached to that port
+    right now still matches what we recorded at attach time (or we never
+    recorded one, e.g. an older attachment from before this check
+    existed) - otherwise detaching would kill someone else's live
+    connection instead of clearing our own zombie."""
     cfg = config.store.read()
-    live_ports = {p.port for p in usbip_client.list_ports()}
+    live = usbip_client.live_port_map()
 
     for att_id, att in cfg["attachments"].items():
         if att.get("server_id") != server_id or att.get("busid") != busid:
             continue
         port = att.get("port")
-        if port in live_ports:
-            try:
-                usbip_client.detach(port)
-                log_event(f"reconnect: detached possibly-stale port {port} before reattaching")
-            except usbip_client.UsbipCommandError as e:
-                log_event(f"reconnect: could not detach possibly-stale port {port}: {e}")
+        stored_local_busid = att.get("local_busid")
+        if port in live:
+            if stored_local_busid is None or stored_local_busid == live[port]:
+                try:
+                    usbip_client.detach(port)
+                    log_event(f"reconnect: detached possibly-stale port {port} before reattaching")
+                except usbip_client.UsbipCommandError as e:
+                    log_event(f"reconnect: could not detach possibly-stale port {port}: {e}")
+            else:
+                log_event(
+                    f"reconnect: port {port} is live but now belongs to a different local "
+                    f"device than this attachment last used - not touching it"
+                )
         return await _restore_dropped_attachment(att_id, att)
 
     if serial:
         for att_id, att in cfg["attachments"].items():
             if att.get("server_id") != server_id or att.get("serial") != serial:
                 continue
-            if att.get("port") in live_ports:
+            port = att.get("port")
+            stored_local_busid = att.get("local_busid")
+            if port in live and (stored_local_busid is None or stored_local_busid == live[port]):
                 continue  # something else is already live on this port
             config.store.update(lambda d, i=att_id, b=busid: d["attachments"][i].__setitem__("busid", b))
             return await _restore_dropped_attachment(att_id, {**att, "busid": busid})
@@ -370,9 +426,16 @@ async def reconnect_device(server_id: str, busid: str, serial: str = "") -> dict
 
 async def _watchdog_tick() -> None:
     cfg = config.store.read()
-    active_ports = {p.port for p in usbip_client.list_ports()}
+    live = usbip_client.live_port_map()
     for att_id, att in list(cfg["attachments"].items()):
-        if att.get("port") in active_ports:
+        port = att.get("port")
+        stored_local_busid = att.get("local_busid")
+        # Live only if something is actually attached on that port number
+        # *and* (when we know it) it's still the same local device we
+        # attached there - a bare port-number match can't tell "still
+        # ours" apart from "port number got reused by a different
+        # attachment after ours silently dropped".
+        if port in live and (stored_local_busid is None or stored_local_busid == live[port]):
             continue
         if _watchdog_should_skip(att):
             continue
