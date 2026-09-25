@@ -643,6 +643,19 @@ async function openAttachmentDetailsPanel(att) {
           codeField(d.stable_path),
         ])
       );
+      if (d.stable_node) {
+        body.appendChild(
+          el("div", {
+            class: "muted",
+            text:
+              `Device node ${d.stable_node.major}:${d.stable_node.minor}` +
+              (d.stable_node.target ? `, mirroring ${d.stable_node.target}` : "") +
+              (d.boot_persistent
+                ? " - recreated at boot before Docker starts, so containers mapping it can start before the reconnect."
+                : " - NOT recreated at boot (mount /etc/tmpfiles.d into this client, see README), so containers mapping it may fail to start after a reboot."),
+          })
+        );
+      }
     } else {
       body.appendChild(
         el("p", {

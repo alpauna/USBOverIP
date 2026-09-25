@@ -61,27 +61,6 @@ def _migrate_attachments_to_id_keys() -> None:
         logger.info("migrated %d attachment(s) from port-keyed to id-keyed schema", len(migrated))
 
 
-def _ensure_attachment_symlinks() -> None:
-    """Best-effort, called on every startup: any attachment that's
-    currently live but has no stable symlink yet - e.g. one that existed
-    before the symlink feature shipped, migrated straight across by
-    _migrate_attachments_to_id_keys with no attach/reconnect cycle to
-    trigger creating one - gets it created now instead of waiting for its
-    next drop/reconnect. Never raises."""
-    cfg = config.store.read()
-    active_ports = {p.port for p in usbip_client.list_ports()}
-    for att_id, att in cfg["attachments"].items():
-        port = att.get("port")
-        if port not in active_ports:
-            continue
-        key = att.get("group_id") or att_id
-        if usbip_client.attachment_symlink_path(key):
-            continue
-        stable_path = groups.update_symlink_for_port(key, port)
-        if stable_path:
-            logger.info("created missing stable symlink for existing attachment %s: %s", att_id, stable_path)
-
-
 @app.on_event("startup")
 async def on_startup():
     try:
@@ -89,9 +68,12 @@ async def on_startup():
     except Exception:
         logger.exception("attachment id migration failed; continuing with existing data")
     try:
-        _ensure_attachment_symlinks()
+        # Before anything else that takes time (tunnels, the first watchdog
+        # tick): downstream containers may be waiting on these paths right
+        # now. Also migrates any pre-node symlink to a real device node.
+        groups.restore_persisted_nodes()
     except Exception:
-        logger.exception("attachment symlink reconciliation failed; continuing without it")
+        logger.exception("stable device node restore failed; continuing without it")
     try:
         _ensure_wireguard_tunnels_up()
     except Exception:
@@ -523,7 +505,7 @@ async def api_direct_attach(
     config.store.update(lambda d, i=att_id, r=record: d["attachments"].__setitem__(i, r))
     groups.log_event(f"direct attach: {server['name']}/{busid} -> port {attached.port}")
 
-    stable_path = groups.update_symlink_for_port(att_id, attached.port)
+    stable_path = groups.update_node_for_port(att_id, attached.port, att_id)
     if stable_path:
         groups.log_event(f"{server['name']}/{busid} stable device path: {stable_path}")
 
@@ -556,7 +538,7 @@ async def api_attachments(user=Depends(require_session_user)):
                 "local_busid": live_ports[port].local_busid if port in live_ports else None,
                 "label": att.get("label") or "",
                 "group_id": att.get("group_id"),
-                "stable_path": usbip_client.attachment_symlink_path(att.get("group_id") or att_id),
+                "stable_path": usbip_client.attachment_node_path(att.get("group_id") or att_id),
                 "attached_at": att.get("attached_at"),
                 "auto_failover": att.get("auto_failover", False),
                 "auto_rebind_on_backoff": att.get("auto_rebind_on_backoff", False),
@@ -597,7 +579,13 @@ async def api_attachment_details(att_id: str, user=Depends(require_session_user)
         "serial": att.get("serial") or "",
         "label": att.get("label") or "",
         "group_id": att.get("group_id"),
-        "stable_path": usbip_client.attachment_symlink_path(att.get("group_id") or att_id),
+        "stable_path": usbip_client.attachment_node_path(att.get("group_id") or att_id),
+        # What the stable node currently mirrors (major:minor + the real
+        # node it was copied from), and whether it will already exist at
+        # the next boot - so the UI can say why a downstream container
+        # would or wouldn't start before this client has reattached.
+        "stable_node": att.get("stable_node"),
+        "boot_persistent": bool(att.get("stable_node")) and usbip_client.tmpfiles_available(),
         "attached_at": att.get("attached_at"),
         "auto_failover": att.get("auto_failover", True),
         "auto_rebind_on_backoff": att.get("auto_rebind_on_backoff", False),
@@ -641,7 +629,8 @@ async def api_detach(att_id: str, request: Request, user=Depends(require_session
     except usbip_client.UsbipCommandError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
     config.store.update(lambda d, i=att_id: d["attachments"].pop(i, None))
-    usbip_client.remove_attachment_symlink(att.get("group_id") or att_id)
+    usbip_client.remove_attachment_node(att.get("group_id") or att_id)
+    groups.sync_tmpfiles_conf()
     groups.log_event(f"detached port {att['port']}")
     return {"ok": True}
 

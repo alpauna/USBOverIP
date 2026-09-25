@@ -17,6 +17,15 @@
 #   - /var/run/docker.sock: optional. Only needed for the "local Docker
 #     containers" panel (e.g. restarting a Home Assistant container after
 #     attaching a device). Remove this line on boxes without Docker.
+#   - /etc/tmpfiles.d: the client writes one file there (usbip-web.conf)
+#     so systemd recreates the stable device nodes /dev/usbip-web/<id> at
+#     boot, *before* docker.service starts. Without it, a downstream
+#     container whose devices: mapping points at one of those paths fails
+#     to start at boot ("error gathering device information ... no such
+#     file or directory") because Docker starts it in parallel with this
+#     client, before the reattach has happened - and Docker never retries
+#     a failed start. Remove on a non-systemd host (the client then just
+#     logs a warning).
 services:
   usbip-client:
     build:
@@ -36,6 +45,7 @@ services:
       - /sys:/sys
       - /lib/modules:/lib/modules:ro
       - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/tmpfiles.d:/etc/tmpfiles.d
       - usbip-client-data:/data
 
 volumes:

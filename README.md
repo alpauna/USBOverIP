@@ -159,6 +159,22 @@ unbind/rebind endpoint on itself (using its own registered bearer token)
 instead of waiting for an admin. Off by default - enable it per
 attachment for devices where you've actually seen this failure mode.
 
+The same checkbox also arms a **startup fast path**: when the *client
+host* reboots, the server never sees the client leave - the TCP session
+just stops - so every device the client had attached is left exported to
+a client that no longer exists. Waiting for six failures meant, with the
+backoff schedule, roughly eight minutes after every reboot before Home
+Assistant & co. got their USB devices back (observed 2026-09-25). So
+within the first three minutes after the client process starts, an
+attachment that is not live locally and gets `Device busy (exported)`
+from the server is treated as exactly that case and rebinds immediately,
+once; the six-failure rule remains behind it. A plain client *container*
+restart doesn't trigger this - vhci attachments live in the host kernel
+and survive it, so those ports still show as live. Note that this is a
+deliberate "the device is mine" claim: if another client really did take
+the device in the meantime, the rebind takes it back - which is why it's
+tied to the same opt-in checkbox rather than on by default.
+
 **A second failure mode this uncovered:** vhci local port numbers are a
 small, reused space - freed and reassigned as attachments come and go.
 The watchdog and the server-push reconnect handler used to treat "some
@@ -391,15 +407,50 @@ showing every attachment as `Live: yes`. The devices genuinely were
 live; each container's device path just no longer pointed at anything.
 
 **What the client already gives you:** every attachment (direct or via a
-group) gets a symlink at `/dev/usbip-web/<attachment-id>`, created on
-attach and retargeted automatically on every reconnect or relocation -
+group) gets a device node at `/dev/usbip-web/<attachment-id>`, created on
+attach and re-pointed automatically on every reconnect or relocation -
 shown as "Stable path" in that attachment's Details panel. The id is
 generated once and never changes for the life of that attachment record,
 regardless of which busid, port, or (for a group) which physical dongle
 on which server is behind it right now.
 
+It is a real character device node (same major:minor as the `/dev/ttyUSBx`
+or `/dev/bus/usb/...` node it mirrors), not a symlink, and the client
+remembers what it was so it can recreate it **before the device is back**:
+
+- At its own startup the client recreates the node for every attachment
+  that isn't live yet, and with `/etc/tmpfiles.d` mounted in (see
+  `docker-compose.client.yml`) it also maintains
+  `/etc/tmpfiles.d/usbip-web.conf`, so systemd recreates the nodes at boot
+  long before `docker.service` starts.
+- Why that matters: at boot Docker starts every restart-policy container
+  in parallel - this client, Home Assistant, zigbee2mqtt, ... all at once.
+  A `devices:` mapping is resolved when the container *starts*; if the
+  host path doesn't exist yet the start fails with
+  `error gathering device information while adding custom device
+  "/dev/usbip-web/<id>": no such file or directory`, and Docker never
+  retries a failed start. Before nodes were persisted, that was every
+  reboot: `/dev` is a fresh tmpfs, the client hadn't reattached yet, and
+  the three serial-device containers (plus anything with `depends_on`
+  them, i.e. Home Assistant itself) stayed down until someone redeployed
+  the stack by hand. With the node already present, `docker start`
+  succeeds; the app inside gets "no such device" until the attach lands a
+  few seconds later and its own `restart:` policy carries it through.
+- A reconnect that lands on the same major:minor is invisible to a
+  running container (Docker bind-mounted that exact inode, and the kernel
+  routes by number). Only when the numbers change does the container need
+  a restart - that's what the attachment's restart actions are for.
+- Because the entries are real nodes, bind-mounting the whole directory
+  (`- /dev/usbip-web:/dev/usbip-web` under `volumes:`, plus
+  `device_cgroup_rules` for the relevant majors - `c 188:* rmw` for
+  `ttyUSB*`, `c 166:* rmw` for `ttyACM*`, `c 189:* rmw` for raw USB) also
+  works, and tolerates the node appearing/changing at any time with no
+  container restart at all. The trade-off is that the app inside must
+  then be configured with the `/dev/usbip-web/<id>` path itself, since a
+  directory mount can't rename a device the way `:targetpath` does.
+
 **How to use it** in a downstream container's `devices:` mapping - map
-the stable symlink to whatever path *that container's own config*
+the stable node to whatever path *that container's own config*
 already expects. Here's the actual Home Assistant stack from the
 incident above, fixed - three services, three different ways their own
 config expects the device to show up, one consistent pattern:
@@ -410,7 +461,7 @@ services:
     image: koenkk/zigbee2mqtt
     devices:
       # zigbee2mqtt's own adapter setting still says /dev/ttyUSB0 -
-      # give it that path, sourced from the stable symlink instead of
+      # give it that path, sourced from the stable node instead of
       # the raw (unstable) /dev/ttyUSBx node.
       - /dev/usbip-web/<zigbee-attachment-id>:/dev/ttyUSB0
     volumes:
@@ -431,7 +482,7 @@ services:
     image: openthread/border-router
     devices:
       # otbr has no fixed internal path expectation of its own - it
-      # reads OT_RCP_DEVICE below, so the stable symlink can be mapped
+      # reads OT_RCP_DEVICE below, so the stable node can be mapped
       # in as itself (no :targetpath needed) as long as the env var
       # below references that exact same path.
       - /dev/usbip-web/<thread-attachment-id>
@@ -450,9 +501,25 @@ that *same path* inside the container, not to the path the app is
 actually configured to open - so `OT_RCP_DEVICE`, zwavejs2mqtt's
 `/dev/zwave` setting, or zigbee2mqtt's `/dev/ttyUSB0` adapter path all
 kept pointing at a path that no longer existed inside that container,
-even though the stable symlink itself was completely correct on the
+even though the stable node itself was completely correct on the
 host. Always include the `:targetpath` half, matching whatever the
 downstream app's own config says.
+
+**After a reboot, the stack won't start at all** - `docker ps -a` shows
+the device containers as `Created`/exited and `journalctl -u docker`
+says `error gathering device information while adding custom device
+"/dev/usbip-web/<id>": no such file or directory`: the node didn't exist
+when Docker tried to start them. Check the attachment's Details panel -
+it says whether the node is "recreated at boot". If it isn't, the client
+is running without `/etc/tmpfiles.d` mounted in (older
+`docker-compose.client.yml`) - add the mount and recreate the client
+container. To recover right now, wait for the client's Events log to
+show the stable device path again (it may take a few minutes if the
+server had a stale export to clear - see "Reconnect backoff and stale
+(zombie) exports"), then `docker start` the failed containers or bring
+the stack up again. Don't "re-pull and redeploy" the whole stack as a
+reflex: it tears down the containers that *did* start, and if it fails
+the same way you end up with nothing running.
 
 **If this happens again** - a container logs "No such file or
 directory" for its serial device (or loops on restart) despite the

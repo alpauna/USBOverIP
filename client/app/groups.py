@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import time
 import uuid
 from collections import deque
 
@@ -54,6 +55,22 @@ BACKOFF_MAX_SECONDS = 1800
 # Fires once per drop-out - _note_reconnect_failure resets the counter on
 # the next successful reconnect, which re-arms it for next time.
 FORCE_REBIND_AFTER_FAILURES = 6
+
+# Startup fast path for the same flag. When this *host* reboots, the server
+# never sees the client go away - the TCP session just stops - so its
+# usbip-host driver keeps every device we had "exported" (in use) to a
+# client that no longer exists. Every reattach then bounces off "Device
+# busy (exported)" until the 6-failure rule above finally fires, which
+# with the backoff schedule is ~8 minutes of Home Assistant & co. having
+# no USB devices after every reboot (observed 2026-09-25). Within this
+# many seconds of the client process starting, an attachment that is not
+# live here and gets "busy" from the server is treated as that exact
+# situation and rebinds immediately, once. A plain container restart
+# doesn't trigger it: vhci attachments live in the host kernel and
+# survive the container, so those ports still show as live.
+STARTUP_REBIND_GRACE_SECONDS = 180
+_PROCESS_STARTED = time.monotonic()
+_startup_rebind_requested: set[str] = set()
 
 
 class GroupError(Exception):
@@ -89,15 +106,35 @@ def _note_reconnect_failure(att_id: str) -> int:
     return result_count
 
 
-async def _maybe_force_rebind(att: dict, server: dict, busid: str, failure_count: int) -> None:
-    if not att.get("auto_rebind_on_backoff") or failure_count != FORCE_REBIND_AFTER_FAILURES:
+def _is_busy_error(error: str) -> bool:
+    # `usbip attach` wording: "Attach Request for 1-2 failed - Device busy (exported)"
+    return "busy" in error.lower()
+
+
+async def _maybe_force_rebind(
+    att: dict, att_id: str, server: dict, busid: str, failure_count: int, error: str
+) -> None:
+    if not att.get("auto_rebind_on_backoff"):
         return
     label = att.get("label") or busid
+    if failure_count == FORCE_REBIND_AFTER_FAILURES:
+        why = f"{failure_count} consecutive failures"
+    elif (
+        _is_busy_error(error)
+        and att_id not in _startup_rebind_requested
+        and time.monotonic() - _PROCESS_STARTED < STARTUP_REBIND_GRACE_SECONDS
+    ):
+        # See STARTUP_REBIND_GRACE_SECONDS. The one-shot set is per process
+        # on purpose: if the rebind doesn't clear it, the regular
+        # 6-failure rule is still there behind it.
+        _startup_rebind_requested.add(att_id)
+        why = "'device busy' right after this client started (stale export from before a reboot)"
+    else:
+        return
     try:
         await remote_client.request_rebind(server["host"], server["api_port"], server["token"], busid)
         log_event(
-            f"{label}: {failure_count} consecutive failures, requested a force unbind/rebind "
-            f"on {server['name']} to clear a possible stale export"
+            f"{label}: {why}, requested a force unbind/rebind on {server['name']} to clear a possible stale export"
         )
     except remote_client.RemoteError as e:
         log_event(f"{label}: force rebind request to {server['name']} failed: {e}")
@@ -142,18 +179,87 @@ def run_restart_actions(actions: list[dict] | None) -> None:
             log_event(f"failed to restart {kind} '{name}': {e}")
 
 
-def update_symlink_for_port(key: str, port: str) -> str | None:
-    """Resolve whatever device node `port` currently produced and (re)point
-    the stable symlink for `key` at it - shared by group attach, direct
-    attach, and reconnect, so all three keep the same symlink in sync the
-    same way."""
+def update_node_for_port(key: str, port: str, att_id: str) -> str | None:
+    """Resolve whatever device node `port` currently produced and make the
+    stable node for `key` mirror it - shared by group attach, direct
+    attach, reconnect and startup, so all four keep the node in sync the
+    same way. What the node is (major:minor, owner, mode) is persisted on
+    the attachment record `att_id` so it can be recreated before the
+    device is back after a reboot (see restore_persisted_nodes)."""
     live = next((p for p in usbip_client.list_ports() if p.port == port), None)
     dev_paths = (
         usbip_client.resolve_device_paths(live.local_busid)
         if live and live.local_busid
         else {"tty": None, "by_id": [], "raw": None}
     )
-    return usbip_client.update_attachment_symlink(key, dev_paths)
+    result = usbip_client.update_attachment_node(key, dev_paths)
+    if not result:
+        return None
+    stable_path, node = result
+
+    def _persist(d, i=att_id, n=node.to_record()):
+        att = d["attachments"].get(i)
+        if att is not None:
+            att["stable_node"] = n
+
+    config.store.update(_persist)
+    sync_tmpfiles_conf()
+    return stable_path
+
+
+def _persisted_nodes(cfg: dict) -> dict[str, usbip_client.StableNode]:
+    nodes: dict[str, usbip_client.StableNode] = {}
+    for att_id, att in cfg["attachments"].items():
+        node = usbip_client.StableNode.from_record(att.get("stable_node"))
+        if node:
+            nodes[att.get("group_id") or att_id] = node
+    return nodes
+
+
+def sync_tmpfiles_conf() -> None:
+    """Rewrite the host's tmpfiles.d entry from the current attachment
+    records, so a reboot recreates exactly the current set of nodes. No-op
+    (logged at startup, not here) if /etc/tmpfiles.d isn't mounted in."""
+    usbip_client.write_tmpfiles_conf(_persisted_nodes(config.store.read()))
+
+
+def restore_persisted_nodes() -> None:
+    """Called once at startup, before the watchdog's first tick. Live
+    attachments (a container restart - vhci ports survive it) get their
+    node refreshed; everything else gets its node recreated from the
+    persisted major:minor so downstream containers whose `devices:`
+    mapping points at it can be started *now*, not after the reconnect
+    lands. Never raises."""
+    cfg = config.store.read()
+    active_ports = {p.port for p in usbip_client.list_ports()}
+    for att_id, att in cfg["attachments"].items():
+        key = att.get("group_id") or att_id
+        label = att.get("label") or att.get("busid") or att_id
+        try:
+            if att.get("port") in active_ports:
+                stable_path = update_node_for_port(key, att["port"], att_id)
+                if stable_path:
+                    logger.info("refreshed stable device node for live attachment %s: %s", label, stable_path)
+                continue
+            node = usbip_client.StableNode.from_record(att.get("stable_node"))
+            if not node:
+                continue
+            stable_path = usbip_client.place_persisted_node(key, node)
+            if stable_path:
+                log_event(
+                    f"{label}: recreated stable device node {stable_path} ({node.major}:{node.minor}) "
+                    f"ahead of its reconnect"
+                )
+        except Exception:
+            logger.exception("stable device node restore failed for attachment %s", att_id)
+    sync_tmpfiles_conf()
+    if cfg["attachments"] and not usbip_client.tmpfiles_available():
+        logger.warning(
+            "%s is not mounted into this container: stable device nodes will only exist once this "
+            "client has started, so containers with devices: mappings on them can fail to start at "
+            "boot - mount it as in docker-compose.client.yml",
+            usbip_client.TMPFILES_DIR,
+        )
 
 
 async def _candidate_status(server: dict, busid: str) -> tuple[bool, str, str]:
@@ -217,7 +323,7 @@ async def attach_group(group_id: str) -> dict:
         config.store.update(lambda d, i=att_id, r=record: d["attachments"].__setitem__(i, r))
         log_event(f"group '{group['name']}' attached via {server['name']}/{candidate['busid']} (port {attached.port})")
 
-        stable_path = update_symlink_for_port(group_id, attached.port)
+        stable_path = update_node_for_port(group_id, attached.port, att_id)
         if stable_path:
             log_event(f"group '{group['name']}' stable device path: {stable_path}")
 
@@ -237,7 +343,8 @@ async def detach_group(group_id: str) -> None:
     port = att["port"]
     usbip_client.detach(port)
     config.store.update(lambda d, i=att_id: d["attachments"].pop(i, None))
-    usbip_client.remove_attachment_symlink(group_id)
+    usbip_client.remove_attachment_node(group_id)
+    sync_tmpfiles_conf()
     log_event(f"group detached (was on port {port})")
 
 
@@ -302,7 +409,7 @@ async def _restore_dropped_attachment(att_id: str, att: dict) -> dict:
         if not relocated_busid:
             log_event(f"auto-reconnect failed for {server['name']}/{target_busid}: {e}")
             count = _note_reconnect_failure(att_id)
-            await _maybe_force_rebind(att, server, target_busid, count)
+            await _maybe_force_rebind(att, att_id, server, target_busid, count, str(e))
             return {"status": "failed", "error": str(e)}
         log_event(
             f"{server['name']}/{target_busid} not found; relocated to {relocated_busid} "
@@ -313,7 +420,7 @@ async def _restore_dropped_attachment(att_id: str, att: dict) -> dict:
         except usbip_client.UsbipCommandError as e2:
             log_event(f"auto-reconnect failed for {server['name']}/{relocated_busid}: {e2}")
             count = _note_reconnect_failure(att_id)
-            await _maybe_force_rebind(att, server, relocated_busid, count)
+            await _maybe_force_rebind(att, att_id, server, relocated_busid, count, str(e2))
             return {"status": "failed", "error": str(e2)}
         target_busid = relocated_busid
 
@@ -329,7 +436,7 @@ async def _restore_dropped_attachment(att_id: str, att: dict) -> dict:
     _note_reconnect_success(att_id)
     log_event(f"auto-reconnect: reattached {server['name']}/{target_busid} on port {attached.port}")
 
-    stable_path = update_symlink_for_port(att_id, attached.port)
+    stable_path = update_node_for_port(att_id, attached.port, att_id)
     if stable_path:
         log_event(f"{server['name']}/{target_busid} stable device path: {stable_path}")
 
@@ -443,9 +550,12 @@ async def _watchdog_tick() -> None:
 
 
 async def watchdog_loop(interval: int = 15) -> None:
+    # First tick runs immediately: after a host reboot every attachment
+    # needs restoring and each second of delay is a second Home Assistant
+    # & co. spend without their devices. Subsequent ticks are paced.
     while True:
-        await asyncio.sleep(interval)
         try:
             await _watchdog_tick()
         except Exception:
             logger.exception("watchdog tick failed")
+        await asyncio.sleep(interval)

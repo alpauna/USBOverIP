@@ -27,6 +27,7 @@ import glob
 import logging
 import os
 import re
+import stat
 import time
 from dataclasses import dataclass
 
@@ -207,20 +208,117 @@ def resolve_device_paths(local_busid: str) -> dict:
     return result
 
 
-# Where we put our own stable, app-managed symlinks for attachments (see
-# update_attachment_symlink below). Distinct from /dev/serial/by-id, which
-# is udev's - keyed off the physical dongle's own vendor/serial strings,
-# so it changes identity whenever the underlying dongle changes (a group
-# failing over to a backup server, or - since busids/ports are not stable
-# identifiers - even a direct attachment relocating after a bus
-# renumbering or reconnecting on a fresh port).
-SYMLINK_DIR = "/dev/usbip-web"
+# Where we put our own stable, app-managed device nodes for attachments
+# (see update_attachment_node below). Distinct from /dev/serial/by-id,
+# which is udev's - keyed off the physical dongle's own vendor/serial
+# strings, so it changes identity whenever the underlying dongle changes
+# (a group failing over to a backup server, or - since busids/ports are
+# not stable identifiers - even a direct attachment relocating after a
+# bus renumbering or reconnecting on a fresh port).
+NODE_DIR = "/dev/usbip-web"
+
+# systemd-tmpfiles config we maintain on the *host* (docker-compose
+# mounts /etc/tmpfiles.d in) so the stable nodes get recreated at boot,
+# before Docker starts any container. See write_tmpfiles_conf for why.
+TMPFILES_DIR = "/etc/tmpfiles.d"
+TMPFILES_PATH = f"{TMPFILES_DIR}/usbip-web.conf"
 
 
-def update_attachment_symlink(key: str, dev_paths: dict) -> str | None:
-    """(Re)point SYMLINK_DIR/<key> at whichever real device node this
-    attachment's current session produced (tty preferred - the common
-    case for this app - falling back to the raw usbfs node). `key` is
+@dataclass
+class StableNode:
+    """What a stable node currently is, in the form the attachment record
+    persists so the node can be recreated (identically) before the device
+    itself is back - after a host reboot, /dev is a fresh tmpfs."""
+
+    target: str  # the real node this mirrors right now, e.g. /dev/ttyUSB0 (informational)
+    major: int
+    minor: int
+    mode: int  # permission bits only (0o660), not the file type
+    uid: int
+    gid: int
+
+    def to_record(self) -> dict:
+        return {
+            "target": self.target,
+            "major": self.major,
+            "minor": self.minor,
+            "mode": self.mode,
+            "uid": self.uid,
+            "gid": self.gid,
+        }
+
+    @classmethod
+    def from_record(cls, rec: dict | None) -> StableNode | None:
+        if not rec:
+            return None
+        try:
+            return cls(
+                target=str(rec.get("target") or ""),
+                major=int(rec["major"]),
+                minor=int(rec["minor"]),
+                mode=int(rec.get("mode", 0o660)),
+                uid=int(rec.get("uid", 0)),
+                gid=int(rec.get("gid", 0)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+def _place_node(key: str, node: StableNode) -> str | None:
+    """Make NODE_DIR/<key> a character device node with node's major:minor,
+    atomically, and only if it isn't one already. Leaving an already-correct
+    node's inode alone matters: a downstream container's `devices:` mapping
+    is a bind mount of that exact inode, so a reconnect that lands on the
+    same major:minor keeps working in a running container with no restart.
+    Falls back to a plain symlink if mknod isn't permitted here (the
+    container isn't privileged), which still works for `devices:` mappings
+    while the target exists. Returns the stable path, or None on failure."""
+    os.makedirs(NODE_DIR, exist_ok=True)
+    stable_path = f"{NODE_DIR}/{key}"
+    rdev = os.makedev(node.major, node.minor)
+    try:
+        cur = os.lstat(stable_path)
+        if stat.S_ISCHR(cur.st_mode) and cur.st_rdev == rdev:
+            if stat.S_IMODE(cur.st_mode) != node.mode or (cur.st_uid, cur.st_gid) != (node.uid, node.gid):
+                try:
+                    os.chmod(stable_path, node.mode)
+                    os.chown(stable_path, node.uid, node.gid)
+                except OSError:
+                    pass
+            return stable_path
+    except FileNotFoundError:
+        pass
+
+    tmp_path = f"{stable_path}.tmp-{os.getpid()}"
+    try:
+        try:
+            os.mknod(tmp_path, stat.S_IFCHR | node.mode, rdev)
+            os.chmod(tmp_path, node.mode)  # mknod applies the umask; mirror the target's mode exactly
+            os.chown(tmp_path, node.uid, node.gid)
+        except PermissionError:
+            if not node.target:
+                raise
+            logger.warning(
+                "mknod not permitted in this container; falling back to a symlink for %s "
+                "(boot-time node persistence unavailable - run the client privileged)",
+                key,
+            )
+            os.symlink(node.target, tmp_path)
+        os.replace(tmp_path, stable_path)  # atomic rename over whatever was there (old node, legacy symlink)
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        logger.exception("failed to update stable device node for %s", key)
+        return None
+    return stable_path
+
+
+def update_attachment_node(key: str, dev_paths: dict) -> tuple[str, StableNode] | None:
+    """Mirror whichever real device node this attachment's current session
+    produced (tty preferred - the common case for this app - falling back
+    to the raw usbfs node) as a device node at NODE_DIR/<key>. `key` is
     whatever stable identity the caller has for "this logical attachment"
     across relocation - a group's own id for group attachments (stable
     across a primary/backup failover to a different physical dongle), or
@@ -228,44 +326,132 @@ def update_attachment_symlink(key: str, dev_paths: dict) -> str | None:
     changes on reconnect - see groups.py's id-keyed attachment records).
     Downstream config (a Docker `devices:` mapping, a fixed HA path) can
     reference this one path indefinitely instead of needing to be
-    hand-edited every time the underlying device node changes. A
-    container still needs restarting to pick up a retargeted symlink
-    (Docker resolves `devices:` to a major:minor at container creation,
-    not live) - restart_actions already handles that part. Returns the
-    stable path, or None if there's no device node yet."""
+    hand-edited every time the underlying device node changes.
+
+    It's a real node (same major:minor as the target), not a symlink, for
+    two reasons: it can exist *before* the device does - see
+    place_persisted_node - so a `devices:` mapping can be resolved by
+    Docker at boot even though the usbip attach hasn't happened yet; and
+    a directory bind mount of NODE_DIR into a container gives that
+    container a working device (a symlink to /dev/ttyUSBx would dangle
+    inside a container that doesn't also have /dev/ttyUSBx).
+
+    Returns (stable_path, node) or None if there's no device node yet."""
     target = dev_paths.get("tty") or dev_paths.get("raw")
     if not target:
         return None
     try:
-        os.makedirs(SYMLINK_DIR, exist_ok=True)
-        stable_path = f"{SYMLINK_DIR}/{key}"
-        tmp_path = f"{stable_path}.tmp-{os.getpid()}"
-        try:
-            os.symlink(target, tmp_path)
-            os.replace(tmp_path, stable_path)  # atomic rename of the symlink itself
-        except OSError:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
+        st = os.stat(target)
     except OSError:
-        logger.exception("failed to update stable symlink for %s", key)
+        logger.warning("device node %s for %s vanished before it could be mirrored", target, key)
         return None
-    return stable_path
-
-
-def attachment_symlink_path(key: str) -> str | None:
-    """The stable path for this key, if update_attachment_symlink has ever
-    created it and it hasn't since been removed."""
-    path = f"{SYMLINK_DIR}/{key}"
-    return path if os.path.islink(path) else None
-
-
-def remove_attachment_symlink(key: str) -> None:
+    if not stat.S_ISCHR(st.st_mode):
+        return None
+    node = StableNode(
+        target=target,
+        major=os.major(st.st_rdev),
+        minor=os.minor(st.st_rdev),
+        mode=stat.S_IMODE(st.st_mode),
+        uid=st.st_uid,
+        gid=st.st_gid,
+    )
     try:
-        os.remove(f"{SYMLINK_DIR}/{key}")
+        stable_path = _place_node(key, node)
+    except OSError:
+        logger.exception("failed to update stable device node for %s", key)
+        return None
+    return (stable_path, node) if stable_path else None
+
+
+def place_persisted_node(key: str, node: StableNode) -> str | None:
+    """Recreate a stable node from what the attachment record persisted,
+    without the device being live. Called at startup for every attachment
+    that isn't (yet) attached, so downstream containers whose `devices:`
+    mappings point at NODE_DIR/<key> can be started by Docker right away
+    (a missing host path is a hard "failed to start container" error that
+    Docker never retries on its own at boot). Opening the node before the
+    device is attached just fails with ENXIO, which is the normal
+    "device not there" error those apps already handle by retrying."""
+    try:
+        return _place_node(key, node)
+    except OSError:
+        logger.exception("failed to recreate persisted stable device node for %s", key)
+        return None
+
+
+def attachment_node_path(key: str) -> str | None:
+    """The stable path for this key, if update_attachment_node (or the
+    boot-time recreation) has created it and it hasn't since been removed.
+    A legacy symlink from before nodes shipped counts too - it gets
+    replaced by a node on the next attach/reconnect/startup."""
+    path = f"{NODE_DIR}/{key}"
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return path if stat.S_ISCHR(st.st_mode) or stat.S_ISLNK(st.st_mode) else None
+
+
+def remove_attachment_node(key: str) -> None:
+    try:
+        os.remove(f"{NODE_DIR}/{key}")
     except FileNotFoundError:
         pass
     except OSError:
-        logger.exception("failed to remove stable symlink for group %s", group_id)
+        logger.exception("failed to remove stable device node for %s", key)
+
+
+def tmpfiles_available() -> bool:
+    """True when the host's /etc/tmpfiles.d is mounted into this container
+    (see docker-compose.client.yml) so boot-time node recreation is
+    possible at all."""
+    return os.path.isdir(TMPFILES_DIR) and os.access(TMPFILES_DIR, os.W_OK)
+
+
+def write_tmpfiles_conf(nodes: dict[str, StableNode]) -> bool:
+    """Write a systemd-tmpfiles config on the host that recreates every
+    stable node at boot. Why this exists: at boot, Docker starts *every*
+    restart-policy container in parallel - this client, Home Assistant,
+    zigbee2mqtt, ... all at once. A container whose `devices:` mapping
+    points at NODE_DIR/<key> is resolved by Docker at start; if the path
+    doesn't exist yet it fails with "error gathering device information
+    ... no such file or directory" and stays down (start failures aren't
+    retried by the restart policy). Recreating the nodes in-process at
+    our own startup still loses that race. systemd-tmpfiles-setup-dev
+    runs long before docker.service and creates `c` entries under /dev
+    from this file, so the nodes are already there when Docker starts -
+    `docker start` succeeds, the app inside gets ENXIO until the device is
+    actually attached (a few seconds later, or minutes if the server has a
+    zombie export to clear), and its own restart policy carries it through.
+
+    Returns False (after logging once) when /etc/tmpfiles.d isn't mounted."""
+    if not tmpfiles_available():
+        return False
+    lines = [
+        "# Managed by usbip-web-client - do not edit; rewritten whenever an attachment changes.",
+        "# Recreates this client's stable USB device nodes at boot, before Docker starts,",
+        "# so downstream containers with devices: mappings on these paths can start even",
+        "# though the usbip attach itself happens later. See usbip-web README.",
+        f"d {NODE_DIR} 0755 root root -",
+    ]
+    for key in sorted(nodes):
+        n = nodes[key]
+        if n.target:
+            lines.append(f"# {key}: last mirrored {n.target}")
+        lines.append(f"c {NODE_DIR}/{key} {n.mode:04o} {n.uid} {n.gid} - {n.major}:{n.minor}")
+    content = "\n".join(lines) + "\n"
+    try:
+        try:
+            with open(TMPFILES_PATH) as f:
+                if f.read() == content:
+                    return True
+        except OSError:
+            pass
+        tmp_path = f"{TMPFILES_PATH}.tmp-{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            f.write(content)
+        os.replace(tmp_path, TMPFILES_PATH)
+    except OSError:
+        logger.exception("failed to write %s", TMPFILES_PATH)
+        return False
+    return True
